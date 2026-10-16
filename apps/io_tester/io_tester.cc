@@ -1,0 +1,1397 @@
+/*
+ * This file is open source software, licensed to you under the terms
+ * of the Apache License, Version 2.0 (the "License").  See the NOTICE file
+ * distributed with this work for additional information regarding copyright
+ * ownership.  You may not use this file except in compliance with the License.
+ *
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+/*
+ * Copyright (C) 2017 ScyllaDB
+ */
+#include <iostream>
+#include <seastar/core/app-template.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/align.hh>
+#include <seastar/core/timer.hh>
+#include <seastar/core/thread.hh>
+#include <seastar/core/print.hh>
+#include <seastar/core/loop.hh>
+#include <seastar/core/with_scheduling_group.hh>
+#include <seastar/core/metrics_api.hh>
+#include <seastar/core/io_intent.hh>
+#include <seastar/util/assert.hh>
+#include <seastar/util/later.hh>
+#include <seastar/util/defer.hh>
+#include <chrono>
+#include <optional>
+#include <ranges>
+#include <utility>
+#include <unordered_set>
+#include <vector>
+#include <boost/range/irange.hpp>
+#include <boost/algorithm/string.hpp>
+
+#pragma GCC diagnostic push
+// see https://github.com/boostorg/accumulators/pull/54
+#pragma GCC diagnostic ignored "-Wuninitialized"
+#include <boost/accumulators/accumulators.hpp>
+#include <boost/accumulators/statistics/stats.hpp>
+#include <boost/accumulators/statistics/max.hpp>
+#include <boost/accumulators/statistics/mean.hpp>
+#include <boost/accumulators/statistics/p_square_quantile.hpp>
+#include <boost/accumulators/statistics/extended_p_square.hpp>
+#include <boost/accumulators/statistics/extended_p_square_quantile.hpp>
+#pragma GCC diagnostic pop
+#include <boost/range/adaptor/filtered.hpp>
+#include <boost/range/adaptor/map.hpp>
+#include <boost/array.hpp>
+#include <iomanip>
+#include <random>
+#include <yaml-cpp/yaml.h>
+
+using namespace seastar;
+using namespace std::chrono_literals;
+using namespace boost::accumulators;
+
+static constexpr uint64_t extent_size_hint_alignment{1u << 20}; // 1MB
+
+static auto random_seed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+static thread_local std::default_random_engine random_generator(random_seed);
+
+class context;
+enum class request_type { seqread, overwrite, randread, randwrite, append, cpu, unlink };
+
+namespace std {
+
+template <>
+struct hash<request_type> {
+    size_t operator() (const request_type& type) const {
+        return static_cast<size_t>(type);
+    }
+};
+
+}
+
+auto allocate_and_fill_buffer(size_t buffer_size) {
+    constexpr size_t alignment{4096u};
+    auto buffer = allocate_aligned_buffer<char>(buffer_size, alignment);
+
+    std::uniform_int_distribution<int> fill('@', '~');
+    memset(buffer.get(), fill(random_generator), buffer_size);
+
+    return buffer;
+}
+
+future<file> create_and_fill_file(sstring name, uint64_t fsize, open_flags flags, file_open_options options, bool fill, bool fallocate) {
+    auto f = co_await open_file_dma(name, flags, options);
+    uint64_t pre_truncate_size = co_await f.size();
+    co_await f.truncate(fsize);
+    if (fallocate) {
+        co_await f.allocate(0, fsize);
+    }
+    if (!fill || (pre_truncate_size >= fsize)) {
+        co_return f;
+    }
+
+    const uint64_t buffer_size{256ul << 10};
+    const uint64_t additional_iteration = (fsize % buffer_size == 0) ? 0 : 1;
+    const uint64_t buffers_count{static_cast<uint64_t>(fsize / buffer_size) + additional_iteration};
+
+    auto source_buffer = allocate_and_fill_buffer(buffer_size);
+    auto buf_raw = source_buffer.get();
+
+    auto buffers_range = std::views::iota(UINT64_C(0), buffers_count);
+    co_await max_concurrent_for_each(buffers_range.begin(), buffers_range.end(), 64,
+            [f, buffer_size, buf_raw] (auto buffer_id) mutable {
+        auto write_position = buffer_id * buffer_size;
+        return f.dma_write(write_position, buf_raw, buffer_size).discard_result();
+    });
+    co_await f.flush();
+    co_return f;
+}
+
+future<> busyloop_sleep(std::chrono::steady_clock::time_point until, std::chrono::steady_clock::time_point now) {
+    return do_until([until] {
+        return std::chrono::steady_clock::now() >= until;
+    }, [] {
+        return yield();
+    });
+}
+
+template <typename Clock>
+future<> timer_sleep(std::chrono::steady_clock::time_point until, std::chrono::steady_clock::time_point now) {
+    return seastar::sleep<Clock>(std::chrono::duration_cast<std::chrono::microseconds>(until - now));
+}
+
+using sleep_fn = std::function<future<>(std::chrono::steady_clock::time_point until, std::chrono::steady_clock::time_point now)>;
+
+class pause_distribution {
+public:
+
+    virtual std::chrono::duration<double> get() = 0;
+
+    template <typename Dur>
+    Dur get_as() {
+        return std::chrono::duration_cast<Dur>(get());
+    }
+
+    virtual ~pause_distribution() {}
+};
+
+using pause_fn = std::function<std::unique_ptr<pause_distribution>(std::chrono::duration<double>)>;
+
+class uniform_process : public pause_distribution {
+    std::chrono::duration<double> _pause;
+
+public:
+    uniform_process(std::chrono::duration<double> period)
+            : _pause(period)
+    {
+    }
+
+    std::chrono::duration<double> get() override {
+        return _pause;
+    }
+};
+
+std::unique_ptr<pause_distribution> make_uniform_pause(std::chrono::duration<double> d) {
+    return std::make_unique<uniform_process>(d);
+}
+
+class poisson_process : public pause_distribution {
+    std::random_device _rd;
+    std::mt19937 _rng;
+    std::exponential_distribution<double> _exp;
+
+public:
+    poisson_process(std::chrono::duration<double> period)
+            : _rng(_rd())
+            , _exp(1.0 / period.count())
+    {
+    }
+
+    std::chrono::duration<double> get() override {
+        return std::chrono::duration<double>(_exp(_rng));
+    }
+};
+
+std::unique_ptr<pause_distribution> make_poisson_pause(std::chrono::duration<double> d) {
+    return std::make_unique<poisson_process>(d);
+}
+
+struct byte_size {
+    uint64_t size;
+};
+
+struct duration_time {
+    std::chrono::duration<float> time;
+};
+
+class shard_config {
+    std::unordered_set<unsigned> _shards;
+public:
+    shard_config()
+        : _shards(boost::copy_range<std::unordered_set<unsigned>>(boost::irange(0u, this_smp_shard_count()))) {}
+    shard_config(std::unordered_set<unsigned> s) : _shards(std::move(s)) {}
+
+    bool is_set(unsigned cpu) const {
+        return _shards.count(cpu);
+    }
+};
+
+struct shard_info {
+    unsigned parallelism = 0;
+    unsigned rps = 0;
+    unsigned batch = 1;
+    unsigned limit = std::numeric_limits<unsigned>::max();
+    unsigned shares = 10;
+    std::string sched_class = "";
+    uint64_t request_size = 4 << 10;
+    uint64_t bandwidth = 0;
+    std::chrono::duration<float> think_time = 0ms;
+    std::chrono::duration<float> think_after = 0ms;
+    std::chrono::duration<float> execution_time = 1ms;
+    seastar::scheduling_group scheduling_group = seastar::default_scheduling_group();
+    bool vectorized = false;
+    unsigned iov_count = 1;
+};
+
+struct options {
+    bool dsync = false;
+    ::sleep_fn sleep_fn = timer_sleep<lowres_clock>;
+    ::pause_fn pause_fn = make_uniform_pause;
+    // the value passed as a hint for allocated extent size
+    // if not specified, then file_size is used as a hint
+    std::optional<uint64_t> extent_allocation_size_hint;
+    bool pre_allocate_blocks = false;
+    std::optional<uint64_t> sloppy_size_hint;
+};
+
+class class_data;
+
+struct job_config {
+    std::string name;
+    request_type type;
+    shard_config shard_placement;
+    ::shard_info shard_info;
+    ::options options;
+    // size of each individual file. Every class and every shard have its file, so in a normal
+    // system with many shards we'll naturally have many files and that will push the data out
+    // of the disk's cache. An exception to that rule is unlink_class_data, that creates files_count
+    // files with file_size/files_count.
+    uint64_t file_size;
+    // the number of files to create and unlink by unlink_class_data per shard
+    // remaining operations utilize only one file per shard
+    std::optional<uint64_t> files_count;
+    uint64_t offset_in_bdev;
+    std::unique_ptr<class_data> gen_class_data();
+};
+
+struct sched_group_config {
+    std::string name;
+    std::string parent;
+    unsigned shares;
+
+    bool is_supergroup = false;
+};
+
+static constexpr std::array<double, 4> quantiles = { 0.5, 0.95, 0.99, 0.999};
+static constexpr std::array<double, 2> quantiles_short = { 0.5, 0.9 };
+static bool keep_files = false;
+
+future<> maybe_remove_file(sstring fname) {
+    return keep_files ? make_ready_future<>() : remove_file(fname);
+}
+
+future<> maybe_close_file(file& f) {
+    return f ? f.close() : make_ready_future<>();
+}
+
+class class_data {
+    struct thinker_state {
+        const std::chrono::duration<float> think_time;
+        const std::chrono::duration<float> think_after;
+        bool thinking;   // true while the think pause is active
+        timer<> t;
+
+        thinker_state(std::chrono::duration<float> think_time_, std::chrono::duration<float> think_after_)
+            : think_time(think_time_)
+            , think_after(think_after_)
+            , thinking(think_after == 0us)   // start thinking immediately unless toggled
+        {
+            t.set_callback([this] {
+                if (thinking) {
+                    thinking = false;
+                    t.arm(std::chrono::duration_cast<std::chrono::microseconds>(think_after));
+                } else {
+                    thinking = true;
+                    t.arm(std::chrono::duration_cast<std::chrono::microseconds>(think_time));
+                }
+            });
+            if (think_after > 0us) {
+                t.arm(std::chrono::duration_cast<std::chrono::microseconds>(think_after));
+            }
+        }
+
+        future<> think() {
+            if (thinking) {
+                return seastar::sleep(std::chrono::duration_cast<std::chrono::microseconds>(think_time));
+            }
+            return make_ready_future<>();
+        }
+    };
+
+protected:
+    using accumulator_type = accumulator_set<double, stats<tag::extended_p_square_quantile(quadratic), tag::mean, tag::max>>;
+
+    job_config _config;
+
+    seastar::scheduling_group _sg;
+
+    size_t _data = 0;
+    std::chrono::duration<float> _total_duration;
+
+    accumulator_type _latencies;
+    uint64_t _requests = 0;
+    ::sleep_fn _sleep_fn = timer_sleep<lowres_clock>;
+    std::optional<thinker_state> _thinker;
+
+    virtual future<> do_start(sstring dir, directory_entry_type type) = 0;
+    virtual future<size_t> issue_request(io_intent* intent) = 0;
+public:
+    class_data(job_config cfg)
+        : _config(std::move(cfg))
+        , _sg(cfg.shard_info.scheduling_group)
+        , _latencies(extended_p_square_probabilities = quantiles)
+        , _sleep_fn(_config.options.sleep_fn)
+    {}
+
+    virtual ~class_data() = default;
+
+private:
+
+    future<> issue_request(io_intent* intent, std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point stop) {
+        return issue_request(intent).then([this, start, stop] (auto size) {
+            auto now = std::chrono::steady_clock::now();
+            if (now < stop) {
+                this->add_result(size, std::chrono::duration_cast<std::chrono::microseconds>(now - start));
+            }
+            return make_ready_future<>();
+        });
+    }
+
+    future<> issue_requests_in_parallel(std::chrono::steady_clock::time_point stop) {
+        if (_config.shard_info.think_time > 0us || _config.shard_info.think_after > 0us) {
+            _thinker.emplace(_config.shard_info.think_time, _config.shard_info.think_after);
+        }
+        return parallel_for_each(std::views::iota(0u, _config.shard_info.parallelism), [this, stop] (auto dummy) mutable {
+            return do_until([this, stop] { return std::chrono::steady_clock::now() > stop || _requests > _config.shard_info.limit; }, [this, stop] () mutable {
+                auto start = std::chrono::steady_clock::now();
+                return issue_request(nullptr, start, stop).then([this] () mutable {
+                    return _thinker ? _thinker->think() : make_ready_future<>();
+                });
+            });
+        });
+    }
+
+    future<> issue_requests_at_rate(std::chrono::steady_clock::time_point stop) {
+        return do_with(io_intent{}, 0u, [this, stop] (io_intent& intent, unsigned& in_flight) {
+            return parallel_for_each(std::views::iota(0u, _config.shard_info.parallelism), [this, stop, &intent, &in_flight] (auto dummy) mutable {
+                auto pause = std::chrono::duration_cast<std::chrono::microseconds>(1s) / _config.shard_info.rps;
+                auto pause_dist = _config.options.pause_fn(pause);
+                return seastar::sleep((pause / _config.shard_info.parallelism) * dummy).then([this, stop, pause = pause_dist.get(), &intent, &in_flight] () mutable {
+                    return do_until([this, stop] { return std::chrono::steady_clock::now() > stop || _requests > _config.shard_info.limit; }, [this, stop, pause, &intent, &in_flight] () mutable {
+                        auto start = std::chrono::steady_clock::now();
+                        in_flight++;
+                        return parallel_for_each(std::views::iota(0u, _config.shard_info.batch), [this, &intent, start, stop] (auto dummy) {
+                            return issue_request(&intent, start, stop);
+                        }).then([this, start, pause] {
+                            auto now = std::chrono::steady_clock::now();
+                            auto p = pause->template get_as<std::chrono::microseconds>();
+                            auto next = start + p;
+
+                            if (next > now) {
+                                return this->_sleep_fn(next, now);
+                            } else {
+                                // probably the system cannot keep-up with this rate
+                                return make_ready_future<>();
+                            }
+                        }).handle_exception_type([] (const cancelled_error&) {
+                            // expected
+                        }).finally([&in_flight] {
+                            in_flight--;
+                        });
+                    });
+                }).finally([pause = std::move(pause_dist)] {});
+            }).then([&intent, &in_flight] {
+                intent.cancel();
+                return do_until([&in_flight] { return in_flight == 0; }, [] { return seastar::sleep(100ms /* ¯\_(ツ)_/¯ */); });
+            });
+        });
+    }
+
+public:
+    future<> issue_requests(std::chrono::steady_clock::time_point stop) {
+        auto start = std::chrono::steady_clock::now();
+        return with_scheduling_group(_sg, [this, stop] {
+            if (_config.shard_info.rps == 0) {
+                return issue_requests_in_parallel(stop);
+            } else {
+                return issue_requests_at_rate(stop);
+            }
+        }).then([this, start] {
+            _total_duration = std::chrono::steady_clock::now() - start;
+        });
+    }
+
+    // Generate the test file(s) for reads and writes alike. It is much simpler to just generate one file per job instead of expecting
+    // job dependencies between creators and consumers. Removal of files is an exception - it creates multiple files during startup to
+    // unlink them. So every job (a class in a shard) will have its own file(s) and will operate differently depending on the type:
+    //
+    // sequential reads  : will read the file from pos = 0 onwards, back to 0 on EOF
+    // overwrites        : will write the file from pos = 0 onwards, back to 0 on EOF
+    // random reads      : will read the file at random positions, between 0 and EOF
+    // random writes     : will overwrite the file at a random position, between 0 and EOF
+    // append            : will write to the file from pos = EOF onwards, always appending to the end.
+    // unlink            : will unlink files created at the beginning of the execution
+    // cpu               : CPU-only load, file is not created.
+    future<> start(sstring dir, directory_entry_type type) {
+        return do_start(dir, type).then([this] {
+            if (this_shard_id() == 0 && _config.shard_info.bandwidth != 0) {
+                return _sg.update_io_bandwidth(_config.shard_info.bandwidth);
+            } else {
+                return make_ready_future<>();
+            }
+        });
+    }
+
+    future<> stop() {
+        return do_stop();
+    }
+
+    const sstring name() const {
+        return _config.name;
+    }
+
+protected:
+    request_type req_type() const {
+        return _config.type;
+    }
+
+    size_t req_size() const {
+        return _config.shard_info.request_size;
+    }
+
+    std::chrono::duration<float> total_duration() const {
+        return _total_duration;
+    }
+
+    uint64_t total_data() const {
+        return _data;
+    }
+
+    uint64_t max_latency() const {
+        return max(_latencies);
+    }
+
+    uint64_t average_latency() const {
+        return mean(_latencies);
+    }
+
+    uint64_t quantile_latency(double q) const {
+        return quantile(_latencies, quantile_probability = q);
+    }
+
+    void add_result(size_t data, std::chrono::microseconds latency) {
+        _data += data;
+        _latencies(latency.count());
+        _requests++;
+    }
+
+public:
+    virtual void emit_results(YAML::Emitter& out) = 0;
+    virtual future<> do_stop() {
+        return make_ready_future<>();
+    }
+};
+
+class io_class_data : public class_data {
+    uint64_t _next_seq_pos = 0;
+    uint64_t _offset = 0;
+    unsigned _overflows = 0;
+    std::uniform_int_distribution<uint32_t> _pos_distribution;
+protected:
+    file _file;
+    const uint64_t _alignment;
+    bool _is_dev_null = false;
+    timer<> _queue_length_timer;
+    accumulator_type _disk_queue_lengths;
+
+    future<size_t> on_io_completed(uint64_t pos, future<size_t> f) {
+        if (_is_dev_null) {
+            // /dev/null completes every request with 0 bytes, report the
+            // request size instead to keep the throughput stats meaningful.
+            return f.then([this] (auto size_f) {
+                return make_ready_future<size_t>(this->req_size());
+            });
+        }
+
+        return f.then([this, pos] (size_t size) {
+            if (size != req_size()) {
+                // Every request is aligned and within the file, so the kernel
+                // either completes it in full or fails it. A partial transfer
+                // means the numbers this job reports are not the workload it
+                // was configured to run.
+                throw std::runtime_error(format("{}: short I/O at offset {}: requested {} bytes, completed {}",
+                        name(), pos, req_size(), size));
+            }
+            return make_ready_future<size_t>(size);
+        });
+    }
+
+    bool is_random() const {
+        return (req_type() == request_type::randread) || (req_type() == request_type::randwrite);
+    }
+
+    uint64_t get_pos() {
+        uint64_t pos;
+        if (is_random()) {
+            pos = _pos_distribution(random_generator) * req_size();
+        } else {
+            pos = _next_seq_pos;
+            _next_seq_pos += req_size();
+            if (_next_seq_pos + req_size() > _config.file_size) {
+                _overflows++;
+                if (req_type() != request_type::append) {
+                    _next_seq_pos = 0;
+                }
+            }
+        }
+        return pos + _offset;
+    }
+
+    // Index i denotes the request-size-aligned offset i * request_size, so the
+    // largest index that still leaves a whole request inside the file is one
+    // below the number of requests the file holds.
+    static uint64_t max_pos_index(const job_config& cfg) {
+        uint64_t requests = cfg.file_size / cfg.shard_info.request_size;
+        return requests > 0 ? requests - 1 : 0;
+    }
+
+public:
+    io_class_data(job_config cfg)
+            : class_data(std::move(cfg))
+            , _pos_distribution(0, max_pos_index(_config))
+            , _alignment(_config.shard_info.request_size >= 4096 ? 4096 : 512)
+            , _queue_length_timer([this] { update_queue_length(); })
+            , _disk_queue_lengths(extended_p_square_probabilities = quantiles_short)
+    {}
+
+    future<> do_start(sstring path, directory_entry_type type) override {
+        return do_start_path(std::move(path), type).then([this] {
+            _queue_length_timer.arm(std::chrono::steady_clock::now() + 500ms, 200ms);
+        });
+    }
+
+    future<> do_stop() override {
+        return maybe_close_file(_file);
+    }
+
+private:
+    void update_queue_length() {
+        // The metric may not exist yet: io_queue lazily registers per-class
+        // metrics on the first I/O request from a scheduling group, but this
+        // timer is armed during file setup before any I/O is issued.
+        if (auto val = get_one_metrics("io_queue_disk_queue_length")) {
+            _disk_queue_lengths(static_cast<unsigned>(*val));
+        }
+    }
+
+    future<> do_start_path(sstring path, directory_entry_type type) {
+        if (type == directory_entry_type::directory) {
+            return do_start_on_directory(path);
+        }
+
+        if (type == directory_entry_type::block_device) {
+            return do_start_on_bdev(path);
+        }
+
+        if (type == directory_entry_type::char_device && path == "/dev/null") {
+            return do_start_on_dev_null();
+        }
+
+        throw std::runtime_error(format("Unsupported storage. {} should be directory or block device", path));
+    }
+
+    future<> do_start_on_directory(sstring dir) {
+        auto fname = format("{}/test-{}-{:d}", dir, name(), this_shard_id());
+        auto flags = open_flags::rw | open_flags::create;
+        if (_config.options.dsync) {
+            flags |= open_flags::dsync;
+        }
+        file_open_options options;
+        options.extent_allocation_size_hint = _config.options.extent_allocation_size_hint.value_or(_config.file_size);
+        if (_config.options.sloppy_size_hint.has_value()) {
+            options.sloppy_size = true;
+            options.sloppy_size_hint = *_config.options.sloppy_size_hint;
+        }
+        options.append_is_unlikely = (req_type() != request_type::append);
+
+        return create_and_fill_file(fname, _config.file_size, flags, options, req_type() != request_type::append, _config.options.pre_allocate_blocks).then([this](file f) {
+            _file = std::move(f);
+            return make_ready_future<>();
+        }).then([fname] {
+            // If keep_files == false, then the file shall not exist after the execution.
+            // After the following function call the usage of the file is valid until `this->_file` object is closed.
+            return maybe_remove_file(fname);
+        });
+    }
+
+    future<> do_start_on_bdev(sstring name) {
+        auto flags = open_flags::rw;
+        if (_config.options.dsync) {
+            flags |= open_flags::dsync;
+        }
+
+        return open_file_dma(name, flags).then([this] (auto f) {
+            _file = std::move(f);
+            return _file.size().then([this] (uint64_t size) {
+                auto shard_area_size = align_down<uint64_t>(size / this_smp_shard_count(), 1 << 20);
+                if (_config.offset_in_bdev + _config.file_size > shard_area_size) {
+                    throw std::runtime_error("Data doesn't fit the blockdevice");
+                }
+                _offset = shard_area_size * this_shard_id() + _config.offset_in_bdev;
+                return make_ready_future<>();
+            });
+        });
+    }
+
+    future<> do_start_on_dev_null() {
+        file_open_options options;
+        options.append_is_unlikely = true;
+        return open_file_dma("/dev/null", open_flags::rw, std::move(options)).then([this] (auto f) {
+            _file = std::move(f);
+            _is_dev_null = true;
+            return make_ready_future<>();
+        });
+    }
+
+    std::optional<double> get_one_metrics(sstring m_name, bool check_class_metrics = true) {
+        const auto& values = seastar::metrics::impl::get_value_map();
+        const auto& mf = values.find(m_name);
+        SEASTAR_ASSERT(mf != values.end());
+        for (auto&& mi : mf->second) {
+            if (check_class_metrics) {
+                auto&& cname = mi.first.labels().find("class");
+                if (cname == mi.first.labels().end() || cname->second.value() != name()) {
+                    continue;
+                }
+            }
+            return mi.second->get_function()().d();
+        }
+        return {};
+    }
+
+    void emit_one_metrics(YAML::Emitter& out, sstring m_name, bool check_class_metrics = true) {
+        if (auto v = get_one_metrics(m_name, check_class_metrics); v.has_value()) {
+            out << YAML::Key << std::string(m_name) << YAML::Value << *v;
+        }
+    }
+
+    void emit_metrics(YAML::Emitter& out) {
+        emit_one_metrics(out, "io_queue_total_exec_sec");
+        emit_one_metrics(out, "io_queue_total_delay_sec");
+        emit_one_metrics(out, "io_queue_total_operations");
+        emit_one_metrics(out, "io_queue_starvation_time_sec");
+        emit_one_metrics(out, "io_queue_consumption");
+        emit_one_metrics(out, "io_queue_adjusted_consumption");
+        emit_one_metrics(out, "io_queue_activations");
+        emit_one_metrics(out, "reactor_aio_outsizes", false);
+    }
+
+public:
+    virtual void emit_results(YAML::Emitter& out) override {
+        auto throughput_kbs = (total_data() >> 10) / total_duration().count();
+        auto iops = _requests / total_duration().count();
+        out << YAML::Key << "throughput" << YAML::Value << throughput_kbs << YAML::Comment("kB/s");
+        out << YAML::Key << "IOPS" << YAML::Value << iops;
+        out << YAML::Key << "latencies" << YAML::Comment("usec");
+        out << YAML::BeginMap;
+        out << YAML::Key << "average" << YAML::Value << average_latency();
+        for (auto& q: quantiles) {
+            out << YAML::Key << fmt::format("p{}", q) << YAML::Value << quantile_latency(q);
+        }
+        out << YAML::Key << "max" << YAML::Value << max_latency();
+        out << YAML::EndMap;
+        out << YAML::Key << "stats" << YAML::BeginMap;
+        out << YAML::Key << "total_requests" << YAML::Value << _requests;
+        emit_metrics(out);
+        out << YAML::Key << "disk_queue_length";
+        out << YAML::BeginMap;
+        for (auto& q: quantiles_short) {
+            out << YAML::Key << fmt::format("p{}", q) << YAML::Value << (unsigned)quantile(_disk_queue_lengths, quantile_probability = q);
+        }
+        out << YAML::Key << "max" << YAML::Value << (unsigned)max(_disk_queue_lengths);
+        out << YAML::EndMap;
+        out << YAML::Key << "file_size_overflows" << YAML::Value << _overflows;
+        out << YAML::EndMap;
+    }
+};
+
+class read_io_class_data : public io_class_data {
+    std::unique_ptr<char[], free_deleter> _buf;
+
+public:
+    read_io_class_data(job_config cfg) : io_class_data(std::move(cfg)) {
+        _buf = allocate_aligned_buffer<char>(req_size(), _alignment);
+    }
+
+    future<size_t> issue_request(io_intent* intent) override {
+        auto pos = this->get_pos();
+        auto f = _file.dma_read(pos, _buf.get(), this->req_size(), intent);
+        return on_io_completed(pos, std::move(f));
+    }
+};
+
+class write_io_class_data : public io_class_data {
+    std::unique_ptr<char[], free_deleter> _buf;
+
+public:
+    write_io_class_data(job_config cfg) : io_class_data(std::move(cfg)) {
+        _buf = allocate_and_fill_buffer(req_size());
+    }
+
+    future<size_t> issue_request(io_intent* intent) override {
+        auto pos = this->get_pos();
+        auto f = _file.dma_write(pos, _buf.get(), this->req_size(), intent);
+        return on_io_completed(pos, std::move(f));
+    }
+};
+
+class vectorized_io_class_data : public io_class_data {
+protected:
+    std::vector<std::unique_ptr<char[], free_deleter>> _buffers;
+    std::vector<iovec> _iovecs;
+    size_t _segment_size;
+
+    vectorized_io_class_data(job_config cfg)
+            : io_class_data(std::move(cfg))
+            , _segment_size(_config.shard_info.request_size / _config.shard_info.iov_count)
+    {
+        if (_config.shard_info.request_size % _config.shard_info.iov_count != 0) {
+            throw std::runtime_error(format("request_size {} must be evenly divisible by iov_count {}",
+                _config.shard_info.request_size, _config.shard_info.iov_count));
+        }
+        if (_segment_size < _alignment || _segment_size % _alignment != 0) {
+            throw std::runtime_error(format("segment_size {} must be at least {} and aligned to {}",
+                _segment_size, _alignment, _alignment));
+        }
+    }
+
+    template <typename Alloc>
+    void allocate_buffers(Alloc alloc_one) {
+        _buffers.reserve(_config.shard_info.iov_count);
+        _iovecs.reserve(_config.shard_info.iov_count);
+
+        for (unsigned i = 0; i < _config.shard_info.iov_count; ++i) {
+            auto buf = alloc_one();
+            _iovecs.push_back(iovec{ buf.get(), _segment_size });
+            _buffers.push_back(std::move(buf));
+        }
+    }
+};
+
+class vectorized_write_io_class_data : public vectorized_io_class_data {
+public:
+    vectorized_write_io_class_data(job_config cfg)
+            : vectorized_io_class_data(std::move(cfg))
+    {
+        allocate_buffers([this] () {
+            return allocate_and_fill_buffer(_segment_size);
+        });
+    }
+
+    future<size_t> issue_request(io_intent* intent) override {
+        auto pos = this->get_pos();
+        std::vector<iovec> iovs = _iovecs;
+        auto f = _file.dma_write(pos, std::move(iovs), intent);
+        return on_io_completed(pos, std::move(f));
+    }
+};
+
+class vectorized_read_io_class_data : public vectorized_io_class_data {
+public:
+    vectorized_read_io_class_data(job_config cfg)
+            : vectorized_io_class_data(std::move(cfg))
+    {
+        allocate_buffers([this] () {
+            return allocate_aligned_buffer<char>(_segment_size, _alignment);
+        });
+    }
+
+    future<size_t> issue_request(io_intent* intent) override {
+        auto pos = this->get_pos();
+        std::vector<iovec> iovs = _iovecs;
+        auto f = _file.dma_read(pos, std::move(iovs), intent);
+        return on_io_completed(pos, std::move(f));
+    }
+};
+
+class unlink_class_data : public class_data {
+private:
+    sstring _dir_path{};
+    uint64_t _file_id_to_remove{0u};
+
+public:
+    unlink_class_data(job_config cfg) : class_data(std::move(cfg)) {
+        if (!_config.files_count.has_value()) {
+            throw std::runtime_error("request_type::unlink requires specifying 'files_count'");
+        }
+    }
+
+    future<> do_start(sstring path, directory_entry_type type) override {
+        if (type == directory_entry_type::directory) {
+            return do_start_on_directory(path);
+        }
+        throw std::runtime_error(format("Unsupported storage. {} should be directory", path));
+    }
+
+    future<size_t> issue_request(io_intent* intent) override {
+        if (all_files_removed()) {
+            fmt::print("[WARNING]: Cannot issue request in unlink_class_data! All files have been removed for shard_id={}\n"
+                       "[WARNING]: Please create more files or adjust the frequency of unlinks.", this_shard_id());
+            return make_ready_future<size_t>(0u);
+        }
+
+        const auto fname = get_filename(_file_id_to_remove);
+        ++_file_id_to_remove;
+
+        return remove_file(fname).then([]{
+            return make_ready_future<size_t>(0u);
+        });
+    }
+
+    void emit_results(YAML::Emitter& out) override {
+        const auto iops = _requests / total_duration().count();
+        out << YAML::Key << "IOPS" << YAML::Value << iops;
+        out << YAML::Key << "latencies" << YAML::Comment("usec");
+        out << YAML::BeginMap;
+        out << YAML::Key << "average" << YAML::Value << average_latency();
+        out << YAML::Key << "max" << YAML::Value << max_latency();
+        out << YAML::EndMap;
+        out << YAML::Key << "stats" << YAML::BeginMap;
+        out << YAML::Key << "total_requests" << YAML::Value << _requests;
+        out << YAML::EndMap;
+    }
+
+private:
+    future<> do_stop() override {
+        if (all_files_removed() || keep_files) {
+            return make_ready_future<>();
+        }
+
+        return max_concurrent_for_each(std::views::iota(_file_id_to_remove, files_count()), max_concurrency(), [this] (uint64_t file_id) {
+            const auto fname = get_filename(file_id);
+            return remove_file(fname);
+        });
+    }
+
+    uint64_t files_count() const {
+        return *_config.files_count;
+    }
+
+    uint64_t max_concurrency() const {
+        // When we have many files it is easy to exceed the limit of open file descriptors.
+        // To avoid that the limit is divided between shards (leaving some room for other jobs).
+        return static_cast<uint64_t>((1024u / this_smp_shard_count()) * 0.8);
+    }
+
+    bool all_files_removed() const {
+        return files_count() <= _file_id_to_remove;
+    }
+
+    sstring get_filename(uint64_t file_id) const {
+        return format("{}/test-{}-shard-{:d}-file-{}", _dir_path, name(), this_shard_id(), file_id);
+    }
+
+    future<> do_start_on_directory(sstring path) {
+        _dir_path = std::move(path);
+
+        return max_concurrent_for_each(std::views::iota(UINT64_C(0), files_count()), max_concurrency(), [this] (uint64_t file_id) {
+            const auto fname = get_filename(file_id);
+            const auto fsize = align_up<uint64_t>(_config.file_size / files_count(), extent_size_hint_alignment);
+            const auto flags = open_flags::rw | open_flags::create;
+
+            file_open_options options;
+            options.extent_allocation_size_hint = _config.options.extent_allocation_size_hint.value_or(fsize);
+            options.append_is_unlikely = true;
+
+            return create_and_fill_file(fname, fsize, flags, options, true, false).then([](file f) {
+                return do_with(std::move(f), [] (auto& f) {
+                    return f.close();
+                });
+            });
+        });
+    }
+};
+
+class cpu_class_data : public class_data {
+public:
+    cpu_class_data(job_config cfg) : class_data(std::move(cfg)) {}
+
+    future<> do_start(sstring dir, directory_entry_type type) override {
+        return make_ready_future<>();
+    }
+
+    future<size_t> issue_request(io_intent* intent) override {
+        // We do want the execution time to be a busy loop, and not just a bunch of
+        // continuations until our time is up: by doing this we can also simulate the behavior
+        // of I/O continuations in the face of reactor stalls.
+        auto start  = std::chrono::steady_clock::now();
+        do {
+        } while ((std::chrono::steady_clock::now() - start) < _config.shard_info.execution_time);
+        return make_ready_future<size_t>(1);
+    }
+
+    virtual void emit_results(YAML::Emitter& out) override {
+        auto throughput = total_data() / total_duration().count();
+        out << YAML::Key << "throughput" << YAML::Value << throughput;
+    }
+};
+
+std::unique_ptr<class_data> job_config::gen_class_data() {
+    switch (type) {
+    case request_type::cpu:
+        return std::make_unique<cpu_class_data>(*this);
+    case request_type::unlink:
+        return std::make_unique<unlink_class_data>(*this);
+    case request_type::seqread:
+    case request_type::randread:
+        if (shard_info.vectorized) {
+            return std::make_unique<vectorized_read_io_class_data>(*this);
+        }
+        return std::make_unique<read_io_class_data>(*this);
+    case request_type::overwrite:
+    case request_type::randwrite:
+    case request_type::append:
+        if (shard_info.vectorized) {
+            return std::make_unique<vectorized_write_io_class_data>(*this);
+        }
+        return std::make_unique<write_io_class_data>(*this);
+    }
+    __builtin_unreachable();
+}
+
+/// YAML parsing functions
+namespace YAML {
+template<>
+struct convert<byte_size> {
+    static bool decode(const Node& node, byte_size& bs) {
+        auto str = node.as<std::string>();
+        unsigned shift = 0;
+        if (str.back() == 'B') {
+            str.pop_back();
+            shift = std::unordered_map<char, unsigned>{
+                { 'k', 10 },
+                { 'M', 20 },
+                { 'G', 30 },
+            }[str.back()];
+            str.pop_back();
+        }
+        bs.size = (boost::lexical_cast<size_t>(str) << shift);
+        return bs.size >= 512;
+    }
+};
+
+template<>
+struct convert<duration_time> {
+    static bool decode(const Node& node, duration_time& dt) {
+        auto str = node.as<std::string>();
+        if (str == "0") {
+            dt.time = 0ns;
+            return true;
+        }
+        if (str.back() != 's') {
+            return false;
+        }
+        str.pop_back();
+        std::unordered_map<char, std::chrono::duration<float>> unit = {
+            { 'n', 1ns },
+            { 'u', 1us },
+            { 'm', 1ms },
+        };
+
+        if (unit.count(str.back())) {
+            auto u = str.back();
+            str.pop_back();
+            dt.time = (boost::lexical_cast<size_t>(str) * unit[u]);
+        } else {
+            dt.time = (boost::lexical_cast<size_t>(str) * 1s);
+        }
+        return true;
+    }
+};
+
+template<>
+struct convert<shard_config> {
+    static bool decode(const Node& node, shard_config& shards) {
+        try {
+            auto str = node.as<std::string>();
+            return (str == "all");
+        } catch (YAML::TypedBadConversion<std::string>& e) {
+            shards = shard_config(boost::copy_range<std::unordered_set<unsigned>>(node.as<std::vector<unsigned>>()));
+            return true;
+        }
+        return false;
+    }
+};
+
+template<>
+struct convert<request_type> {
+    static bool decode(const Node& node, request_type& rt) {
+        static std::unordered_map<std::string, request_type> mappings = {
+            { "seqread", request_type::seqread },
+            { "overwrite", request_type::overwrite},
+            { "randread", request_type::randread },
+            { "randwrite", request_type::randwrite },
+            { "append", request_type::append},
+            { "cpu", request_type::cpu},
+            { "unlink", request_type::unlink },
+        };
+        auto reqstr = node.as<std::string>();
+        if (!mappings.count(reqstr)) {
+            return false;
+        }
+        rt = mappings[reqstr];
+        return true;
+    }
+};
+
+template<>
+struct convert<shard_info> {
+    static bool decode(const Node& node, shard_info& sl) {
+        if (node["parallelism"]) {
+            sl.parallelism = node["parallelism"].as<unsigned>();
+        }
+        if (node["rps"]) {
+            sl.rps = node["rps"].as<unsigned>();
+        }
+        if (node["batch"]) {
+            sl.batch = node["batch"].as<unsigned>();
+        }
+        if (node["limit"]) {
+            sl.limit = node["limit"].as<unsigned>();
+        }
+
+        if (node["shares"]) {
+            sl.shares = node["shares"].as<unsigned>();
+        } else if (node["class"]) {
+            sl.sched_class = node["class"].as<std::string>();
+        }
+        if (node["bandwidth"]) {
+            sl.bandwidth = node["bandwidth"].as<byte_size>().size;
+        }
+        if (node["reqsize"]) {
+            sl.request_size = node["reqsize"].as<byte_size>().size;
+        }
+        if (node["think_time"]) {
+            sl.think_time = node["think_time"].as<duration_time>().time;
+        }
+        if (node["think_after"]) {
+            sl.think_after = node["think_after"].as<duration_time>().time;
+        }
+        if (node["execution_time"]) {
+            sl.execution_time = node["execution_time"].as<duration_time>().time;
+        }
+        if (node["vectorized"]) {
+            sl.vectorized = node["vectorized"].as<bool>();
+        }
+        if (node["iov_count"]) {
+            sl.iov_count = node["iov_count"].as<unsigned>();
+            if (sl.iov_count == 0) {
+                throw std::runtime_error("iov_count must be at least 1");
+            }
+        }
+        return true;
+    }
+};
+
+template<>
+struct convert<options> {
+    static bool decode(const Node& node, options& op) {
+        if (node["dsync"]) {
+            op.dsync = node["dsync"].as<bool>();
+        }
+        if (node["sleep_type"]) {
+            auto st = node["sleep_type"].as<std::string>();
+            if (st == "busyloop") {
+                op.sleep_fn = busyloop_sleep;
+            } else if (st == "lowres") {
+                op.sleep_fn = timer_sleep<lowres_clock>;
+            } else if (st == "steady") {
+                op.sleep_fn = timer_sleep<std::chrono::steady_clock>;
+            } else {
+                throw std::runtime_error(seastar::format("Unknown sleep_type {}", st));
+            }
+        }
+        if (node["pause_distribution"]) {
+            auto pd = node["pause_distribution"].as<std::string>();
+            if (pd == "uniform") {
+                op.pause_fn = make_uniform_pause;
+            } else if (pd == "poisson") {
+                op.pause_fn = make_poisson_pause;
+            } else {
+                throw std::runtime_error(seastar::format("Unknown pause_distribution {}", pd));
+            }
+        }
+        // By default the file size is used as the allocation hint.
+        // However, certain tests may require using a specific value (e.g. 32MB).
+        if (node["extent_allocation_size_hint"]) {
+            op.extent_allocation_size_hint = node["extent_allocation_size_hint"].as<byte_size>().size;
+        }
+        if (node["sloppy_size_hint"]) {
+            op.sloppy_size_hint = node["sloppy_size_hint"].as<byte_size>().size;
+        }
+        if (node["fallocate"]) {
+            op.pre_allocate_blocks = node["fallocate"].as<bool>();
+        }
+
+        return true;
+    }
+};
+
+template<>
+struct convert<job_config> {
+    static bool decode(const Node& node, job_config& cl) {
+        cl.name = node["name"].as<std::string>();
+        cl.type = node["type"].as<request_type>();
+        cl.shard_placement = node["shards"].as<shard_config>();
+        // The data_size is used to divide the available (and effectively
+        // constant) disk space between workloads. Each shard inside the
+        // workload thus uses its portion of the assigned space.
+        if (node["data_size"]) {
+            const uint64_t per_shard_bytes = node["data_size"].as<byte_size>().size / this_smp_shard_count();
+            cl.file_size = align_up<uint64_t>(per_shard_bytes, extent_size_hint_alignment);
+        } else if (cl.type == request_type::append) {
+            cl.file_size = 0;
+        } else {
+            cl.file_size = 1ull << 30; // 1G by default
+        }
+
+        // By default a job may create 0 or 1 file.
+        // That is not the case for unlink_class_data - it creates multiple
+        // files that are unlinked during the execution.
+        if (node["files_count"]) {
+            cl.files_count = node["files_count"].as<uint64_t>();
+        }
+
+        if (node["shard_info"]) {
+            cl.shard_info = node["shard_info"].as<shard_info>();
+        }
+        if (node["options"]) {
+            cl.options = node["options"].as<options>();
+        }
+
+        return true;
+    }
+};
+
+template<>
+struct convert<sched_group_config> {
+    static bool decode(const Node& node, sched_group_config& sc) {
+        sc.name = node["name"].as<std::string>();
+        sc.shares = node["shares"].as<unsigned>();
+        if (node["parent"]) {
+            sc.parent = node["parent"].as<std::string>();
+        }
+        return true;
+    }
+};
+}
+
+/// Each shard has one context, and the context is responsible for creating the classes that should
+/// run in this shard.
+class context {
+    std::vector<std::unique_ptr<class_data>> _cl;
+
+    sstring _dir;
+    directory_entry_type _type;
+    std::chrono::seconds _duration;
+
+    semaphore _finished;
+public:
+    context(sstring dir, directory_entry_type dtype, std::vector<job_config> req_config, unsigned duration)
+            : _cl(boost::copy_range<std::vector<std::unique_ptr<class_data>>>(req_config
+                | boost::adaptors::filtered([] (auto& cfg) { return cfg.shard_placement.is_set(this_shard_id()); })
+                | boost::adaptors::transformed([] (auto& cfg) { return cfg.gen_class_data(); })
+            ))
+            , _dir(dir)
+            , _type(dtype)
+            , _duration(duration)
+            , _finished(0)
+    {}
+
+    future<> stop() {
+        return parallel_for_each(_cl, [] (std::unique_ptr<class_data>& cl) {
+            return cl->stop();
+        });
+    }
+
+    future<> start() {
+        return parallel_for_each(_cl, [this] (std::unique_ptr<class_data>& cl) {
+            return cl->start(_dir, _type);
+        });
+    }
+
+    future<> issue_requests() {
+        return parallel_for_each(_cl.begin(), _cl.end(), [this] (std::unique_ptr<class_data>& cl) {
+            return cl->issue_requests(std::chrono::steady_clock::now() + _duration).finally([this] {
+                _finished.signal(1);
+            });
+        });
+    }
+
+    future<> emit_results(YAML::Emitter& out) {
+        return _finished.wait(_cl.size()).then([this, &out] {
+            for (auto& cl: _cl) {
+                out << YAML::Key << std::string(cl->name());
+                out << YAML::BeginMap;
+                cl->emit_results(out);
+                out << YAML::EndMap;
+            }
+            out << YAML::Key << "statistics";
+            out << YAML::BeginMap;
+            out << YAML::Key << "aio_retries" << YAML::Value << engine().get_io_stats().aio_retries;
+            out << YAML::EndMap;
+            return make_ready_future<>();
+        });
+    }
+};
+
+static void show_results(sharded<context>& ctx) {
+    YAML::Emitter out;
+    out << YAML::BeginDoc;
+    out << YAML::BeginSeq;
+    for (unsigned i = 0; i < this_smp_shard_count(); ++i) {
+        out << YAML::BeginMap;
+        out << YAML::Key << "shard" << YAML::Value << i;
+        ctx.invoke_on(i, [&out] (auto& c) {
+            return c.emit_results(out);
+        }).get();
+        out << YAML::EndMap;
+    }
+    out << YAML::EndSeq;
+    out << YAML::EndDoc;
+    std::cout << out.c_str();
+}
+
+int main(int ac, char** av) {
+    namespace bpo = boost::program_options;
+
+    app_template app;
+    auto opt_add = app.add_options();
+    opt_add
+        ("storage", bpo::value<sstring>()->default_value("."), "directory or block device where to execute the test")
+        ("duration", bpo::value<unsigned>()->default_value(10), "for how long (in seconds) to run the test")
+        ("conf", bpo::value<sstring>()->default_value("./conf.yaml"), "YAML file containing benchmark specification")
+        ("keep-files", bpo::value<bool>()->default_value(false), "keep test files, next run may re-use them")
+        ("sched-groups", bpo::value<sstring>(), "YAML file containing scheduling groups configuration")
+    ;
+
+    sharded<context> ctx;
+    return app.run(ac, av, [&] {
+        return seastar::async([&] {
+            auto& opts = app.configuration();
+            auto& storage = opts["storage"].as<sstring>();
+
+            auto st_type = engine().file_type(storage).get();
+
+            if (!st_type) {
+                throw std::runtime_error(format("Unknown storage {}", storage));
+            }
+
+            if (*st_type == directory_entry_type::directory) {
+                auto fs = file_system_at(storage).get();
+                if (fs != fs_type::xfs) {
+                    std::cout << "WARNING!!! This is a performance test. " << storage << " is not on XFS" << std::endl;
+                }
+            }
+
+            keep_files = opts["keep-files"].as<bool>();
+            auto& duration = opts["duration"].as<unsigned>();
+            auto& yaml = opts["conf"].as<sstring>();
+            YAML::Node doc = YAML::LoadFile(yaml);
+            auto reqs = doc.as<std::vector<job_config>>();
+
+            struct sched_class {
+                seastar::scheduling_group sg;
+                seastar::scheduling_supergroup ssg;
+            };
+            std::unordered_map<std::string, sched_class> sched_classes;
+
+            if (opts.contains("sched-groups")) {
+                auto& yaml = opts["sched-groups"].as<sstring>();
+                YAML::Node doc = YAML::LoadFile(yaml);
+                auto sched_config = doc.as<std::vector<sched_group_config>>();
+
+                // First, find out which sched_group_config-s are supergroups
+                for (auto& sg : sched_config) {
+                    if (sg.parent.empty()) {
+                        continue;
+                    }
+
+                    auto parent = std::find_if(sched_config.begin(), sched_config.end(), [&sg] (auto& s) { return s.name == sg.parent; });
+                    if (parent == sched_config.end()) {
+                        throw std::runtime_error(fmt::format("Unknown parent sched group {} for {} in config", sg.parent, sg.name));
+                    }
+                    parent->is_supergroup = true;
+                }
+
+                // Second, create the supergroups
+                parallel_for_each(sched_config, [&sched_classes] (auto& g) {
+                    if (!g.is_supergroup) {
+                        return make_ready_future<>();
+                    }
+
+                    fmt::print("Creating {} supergroup\n", g.name);
+                    return seastar::create_scheduling_supergroup(g.shares).then([&g, &sched_classes] (seastar::scheduling_supergroup ssg) {
+                        sched_classes.insert(std::make_pair(g.name, sched_class { .ssg = ssg }));
+                    });
+                }).get();
+
+                // Finally, create the sched groups
+                parallel_for_each(sched_config, [&sched_classes] (auto& g) {
+                    if (g.is_supergroup) {
+                        return make_ready_future<>();
+                    }
+
+                    seastar::scheduling_supergroup parent;
+                    if (!g.parent.empty()) {
+                        fmt::print("Creating {}.{} group\n", g.parent, g.name);
+                        parent = sched_classes.at(g.parent).ssg;
+                    } else {
+                        fmt::print("Creating {} group\n", g.name);
+                    }
+                    return seastar::create_scheduling_group(g.name, g.name, g.shares, parent).then([&g, &sched_classes] (seastar::scheduling_group sg) {
+                        sched_classes.insert(std::make_pair(g.name, sched_class { .sg = sg }));
+                    });
+                }).get();
+            }
+
+            parallel_for_each(reqs, [&sched_classes] (auto& r) {
+                if (!r.shard_info.sched_class.empty()) {
+                    return make_ready_future<>();
+                }
+
+                fmt::print("Creating {} group (by job name)\n", r.name);
+                return seastar::create_scheduling_group(r.name, r.shard_info.shares).then([&r, &sched_classes] (seastar::scheduling_group sg) {
+                    sched_classes.insert(std::make_pair(r.name, sched_class {
+                        .sg = sg,
+                    }));
+                });
+            }).get();
+
+            for (job_config& r : reqs) {
+                auto cname = !r.shard_info.sched_class.empty() ? r.shard_info.sched_class : r.name;
+                fmt::print("Job {} -> sched class {}\n", r.name, cname);
+                auto& sc = sched_classes.at(cname);
+                r.shard_info.scheduling_group = sc.sg;
+            }
+
+            if (*st_type == directory_entry_type::block_device) {
+                uint64_t off = 0;
+                for (job_config& r : reqs) {
+                    r.offset_in_bdev = off;
+                    off += r.file_size;
+                }
+            }
+
+            ctx.start(storage, *st_type, reqs, duration).get();
+            auto stop = defer([&ctx] () noexcept { ctx.stop().get(); });
+            std::cout << "Creating initial files..." << std::endl;
+            ctx.invoke_on_all([] (auto& c) {
+                return c.start();
+            }).get();
+            std::cout << "Starting evaluation..." << std::endl;
+            ctx.invoke_on_all([] (auto& c) {
+                return c.issue_requests();
+            }).get();
+            show_results(ctx);
+        }).or_terminate();
+    });
+}

@@ -1,0 +1,302 @@
+/*
+ * Copyright 2021 ScyllaDB
+ */
+
+#include <seastar/core/future.hh>
+#include <seastar/websocket/server.hh>
+#include <seastar/websocket/client.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
+#include <seastar/http/response_parser.hh>
+#include <seastar/util/defer.hh>
+#include <seastar/util/memory-data-source.hh>
+#include "loopback_socket.hh"
+
+BOOST_TEST_DONT_PRINT_LOG_VALUE(std::vector<seastar::sstring>)
+
+using namespace seastar;
+using namespace seastar::experimental;
+using namespace std::literals::string_view_literals;
+
+std::string build_request(std::string_view key_base64, std::string_view subprotocol) {
+    std::string subprotocol_line;
+    if (!subprotocol.empty()) {
+        subprotocol_line = fmt::format("Sec-WebSocket-Protocol: {}\r\n", subprotocol);
+    }
+
+    return fmt::format(
+        "GET / HTTP/1.1\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: {}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "{}"
+        "\r\n",
+        key_base64,
+        subprotocol_line);
+}
+
+future<> test_websocket_handshake_common(std::string subprotocol) {
+    const std::string request = build_request("dGhlIHNhbXBsZSBub25jZQ==", subprotocol);
+
+    loopback_connection_factory factory;
+    loopback_socket_impl lsi(factory);
+
+    future<accept_result> accepted = factory.get_server_socket().accept();
+    connected_socket sock = co_await lsi.connect(socket_address(), socket_address());
+    auto input = sock.input();
+    auto output = sock.output();
+
+    websocket::server dummy;
+    dummy.register_handler(subprotocol, [](input_stream<char>& in, output_stream<char>& out) -> future<> {
+        while (true) {
+            auto f = co_await in.read();
+            if (f.empty()) {
+                break;
+            }
+            co_await out.write(std::move(f));
+            co_await out.flush();
+        }
+    });
+    websocket::server_connection conn(dummy, (co_await std::move(accepted)).connection);
+    future<> serve = conn.process();
+
+    std::exception_ptr ex;
+    try {
+        // Send the handshake
+        co_await output.write(request);
+        co_await output.flush();
+        // Check that the server correctly computed the response
+        // according to WebSocket handshake specification
+        http_response_parser parser;
+        parser.init();
+        co_await input.consume(parser);
+        std::unique_ptr<http::reply> resp = parser.get_parsed_response();
+        SEASTAR_ASSERT(resp);
+        sstring websocket_accept = resp->_headers["Sec-WebSocket-Accept"];
+        // Trim possible whitespace prefix
+        auto it = std::find_if(websocket_accept.begin(), websocket_accept.end(), ::isalnum);
+        if (it != websocket_accept.end()) {
+            websocket_accept.erase(websocket_accept.begin(), it);
+        }
+        BOOST_REQUIRE_EQUAL(websocket_accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        for (auto& header : resp->_headers) {
+            std::cout << header.first << ':' << header.second << std::endl;
+        }
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await conn.close();
+    co_await input.close();
+    co_await output.close();
+    co_await std::move(serve);
+
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+}
+
+SEASTAR_TEST_CASE(test_websocket_handshake) {
+    return test_websocket_handshake_common("echo");
+}
+
+SEASTAR_TEST_CASE(test_websocket_handshake_no_subprotocol) {
+    return test_websocket_handshake_common("");
+}
+
+future<> test_websocket_handler_registration_common(std::string subprotocol) {
+    loopback_connection_factory factory;
+    loopback_socket_impl lsi(factory);
+
+    future<accept_result> accepted = factory.get_server_socket().accept();
+    connected_socket sock = co_await lsi.connect(socket_address(), socket_address());
+    auto input = sock.input();
+    auto output = sock.output();
+
+    // Setup server
+    websocket::server ws;
+    ws.register_handler(subprotocol, [](input_stream<char>& in, output_stream<char>& out) -> future<> {
+        while (true) {
+            auto f = co_await in.read();
+            if (f.empty()) {
+                break;
+            }
+            co_await out.write(std::move(f));
+            co_await out.flush();
+        }
+    });
+    websocket::server_connection conn(ws, (co_await std::move(accepted)).connection);
+    future<> serve = conn.process();
+
+    // handshake
+    const std::string request = build_request("dGhlIHNhbXBsZSBub25jZQ==", subprotocol);
+
+    unsigned reply_size = 156;
+    if (!subprotocol.empty()) {
+        reply_size += ("\r\nSec-WebSocket-Protocol: "sv).size() + subprotocol.size();
+    }
+
+    unsigned ws_frame_len = 10;
+
+    // Sending and receiving a websocket frame
+    const std::string ws_frame = std::string(
+        "\202\204"  // 1000 0002 1000 0100
+        "TEST"      // Masking Key
+        "\0\0\0\0", ws_frame_len); // Masked Message - TEST
+    const auto rs_frame = std::string(
+        "\202\004" // 1000 0002 0000 0100
+        "TEST", 6);    // Message - TEST
+
+    std::exception_ptr ex;
+    try {
+        co_await output.write(request);
+        co_await output.flush();
+
+        co_await input.read_exactly(reply_size);
+
+        co_await output.write(ws_frame);
+        co_await output.flush();
+
+        auto response = co_await input.read_exactly(6);
+        auto response_str = std::string(response.begin(), response.end());
+        BOOST_REQUIRE_EQUAL(rs_frame, response_str);
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await conn.close();
+    co_await input.close();
+    co_await output.close();
+    co_await std::move(serve);
+
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+}
+
+SEASTAR_TEST_CASE(test_websocket_handler_registration) {
+    return test_websocket_handler_registration_common("echo");
+}
+
+SEASTAR_TEST_CASE(test_websocket_handler_registration_no_subprotocol) {
+    return test_websocket_handler_registration_common("");
+}
+
+// Simple wrapper to help create a testable input_stream.
+
+SEASTAR_TEST_CASE(test_websocket_parser_split) {
+    return seastar::async([] {
+        // Two websocket frames
+        std::string ws_frames = std::string(
+            "\x82\x85"    // FIN, opcode, mask, payload len (5)
+            "\0\0\0\0"    // Masking Key
+            "TEST1"       // payload
+            "\x82\x85"    // FIN, opcode, mask, payload len (5)
+            "\0\0\0\0"    // Masking Key
+            "TEST2"
+            "\x82\x85"    // FIN, opcode, mask, payload len (5)
+            "\0\0\0\0"    // Masking Key
+            "TEST3", 33); // payload
+
+        for (unsigned split_i = 0; split_i < ws_frames.size() - 1; ++split_i) {
+            websocket::websocket_parser parser;
+
+            auto bufs = std::vector<temporary_buffer<char>>{};
+
+            if (split_i == 0) {
+                bufs.push_back(temporary_buffer<char>::copy_of(ws_frames));
+            } else {
+                bufs.push_back(temporary_buffer<char>::copy_of(ws_frames.substr(0, split_i)));
+                bufs.push_back(temporary_buffer<char>::copy_of(ws_frames.substr(split_i)));
+            }
+
+            input_stream<char> in = util::as_input_stream(std::move(bufs));
+
+            std::vector<sstring> results;
+
+            while (true) {
+                in.consume(parser).get();
+                if (parser.eof()) {
+                    break;
+                }
+
+                SEASTAR_ASSERT(parser.is_valid());
+                results.push_back(seastar::to_sstring(parser.result()));
+            }
+
+            SEASTAR_ASSERT(!parser.is_valid());
+            BOOST_REQUIRE_EQUAL(0, parser.result().size());
+
+            std::vector<sstring> expected = {
+                "TEST1",
+                "TEST2",
+                "TEST3",
+            };
+
+            BOOST_REQUIRE_EQUAL(results, expected);
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(test_websocket_client_server) {
+    loopback_connection_factory factory;
+    loopback_socket_impl lsi(factory);
+
+    // Setup server side
+    websocket::server ws;
+    ws.register_handler("echo", [] (input_stream<char>& in,
+                    output_stream<char>& out) -> future<> {
+        while (true) {
+            auto f = co_await in.read();
+            if (f.empty()) {
+                break;
+            }
+
+            co_await out.write(std::move(f));
+            co_await out.flush();
+        }
+    });
+
+    auto acceptor = factory.get_server_socket().accept();
+    auto connector = lsi.connect(socket_address(), socket_address());
+
+    // Server side
+    connected_socket server_sock = (co_await std::move(acceptor)).connection;
+    websocket::server_connection server_conn(ws, std::move(server_sock));
+    auto serve = server_conn.process();
+
+    // Client side
+    connected_socket client_sock = co_await std::move(connector);
+
+    sstring received_data;
+    promise<> client_done;
+
+    websocket::client_connection client_conn(std::move(client_sock), "/", "localhost",
+        "echo",
+        [&received_data, &client_done] (input_stream<char>& in, output_stream<char>& out) -> future<> {
+            co_await out.write("hello");
+            co_await out.flush();
+
+            auto buf = co_await in.read();
+            received_data = sstring(buf.get(), buf.size());
+
+            co_await out.close();
+            client_done.set_value();
+        });
+
+    co_await client_conn.handshake();
+    auto client_process = client_conn.process().handle_exception(
+        [] (std::exception_ptr) {});
+
+    co_await client_done.get_future();
+
+    BOOST_REQUIRE_EQUAL(received_data, "hello");
+
+    // Shut down cleanly: close client first (sends CLOSE frame), then server
+    co_await client_conn.close();
+    co_await std::move(client_process);
+    co_await server_conn.close();
+    co_await std::move(serve);
+}

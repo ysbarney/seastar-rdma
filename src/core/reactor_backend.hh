@@ -1,0 +1,475 @@
+/*
+ * This file is open source software, licensed to you under the terms
+ * of the Apache License, Version 2.0 (the "License").  See the NOTICE file
+ * distributed with this work for additional information regarding copyright
+ * ownership.  You may not use this file except in compliance with the License.
+ *
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+/*
+ * Copyright 2019 ScyllaDB
+ */
+
+#pragma once
+
+#include <seastar/core/future.hh>
+#include <seastar/core/posix.hh>
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/internal/io_desc.hh>
+#include <seastar/core/internal/pollable_fd.hh>
+#include <seastar/core/internal/poll.hh>
+#include <seastar/core/internal/linux-aio.hh>
+#include <seastar/core/cacheline.hh>
+#include <seastar/core/reactor_config.hh>
+#include <seastar/core/smp_options.hh>
+#include <seastar/util/bool_class.hh>
+#include <seastar/core/shard_id.hh>
+#include <seastar/core/resource.hh>
+
+#include <seastar/core/internal/fmt.hh>
+#include <sys/time.h>
+#include <bitset>
+#include <thread>
+#include <stack>
+#include <span>
+#include <memory>
+#include <vector>
+#include <optional>
+#include <boost/program_options.hpp>
+#include <boost/container/static_vector.hpp>
+
+
+#ifdef SEASTAR_DEBUG
+#define SEASTAR_IOCB_POOL_DEBUG
+#endif
+
+#ifdef SEASTAR_HAVE_URING
+#include <liburing.h>
+#endif
+
+namespace seastar {
+
+class reactor;
+class thread_pool;
+// FIXME: merge it with storage context below. At this point the
+// main thing to do is unify the iocb list
+struct aio_general_context {
+    explicit aio_general_context(size_t nr);
+    ~aio_general_context();
+    internal::linux_abi::aio_context_t io_context{};
+    std::unique_ptr<internal::linux_abi::iocb*[]> iocbs;
+    internal::linux_abi::iocb** last;
+    internal::linux_abi::iocb** const end;
+    void queue(internal::linux_abi::iocb* iocb);
+    // submit all queued iocbs and return their count.
+    size_t flush();
+};
+
+class aio_storage_context {
+    static constexpr unsigned max_aio = 1024;
+
+    class iocb_pool {
+        alignas(cache_line_size) std::array<internal::linux_abi::iocb, max_aio> _all_iocbs;
+        std::stack<internal::linux_abi::iocb*, boost::container::static_vector<internal::linux_abi::iocb*, max_aio>> _free_iocbs;
+#ifdef SEASTAR_IOCB_POOL_DEBUG
+        // Track which iocbs are currently allocated (not in free list)
+        // This helps detect double-free bugs
+        std::bitset<max_aio> _iocb_allocated;
+#endif
+    public:
+        iocb_pool();
+        internal::linux_abi::iocb& get_one();
+        void put_one(internal::linux_abi::iocb* io);
+        unsigned outstanding() const;
+        bool has_capacity() const;
+    };
+
+    reactor& _r;
+    internal::linux_abi::aio_context_t _io_context;
+    boost::container::static_vector<internal::linux_abi::iocb*, max_aio> _submission_queue;
+    iocb_pool _iocb_pool;
+    size_t handle_aio_error(internal::linux_abi::iocb* iocb, int ec);
+    void cancel_iocb(internal::linux_abi::iocb* iocb);
+    void retry_iocb(internal::linux_abi::iocb* iocb);
+    using pending_aio_retry_t = boost::container::static_vector<internal::linux_abi::iocb*, max_aio>;
+    pending_aio_retry_t _pending_aio_retry; // Pending retries iocbs
+    pending_aio_retry_t _aio_retries;       // Currently retried iocbs
+    future<> _pending_aio_retry_fut = make_ready_future<>();
+    condition_variable _retry_cv;
+    bool _stopping = false;
+    internal::linux_abi::io_event _ev_buffer[max_aio];
+
+    bool need_to_retry() const noexcept {
+        return !_pending_aio_retry.empty() || !_aio_retries.empty();
+    }
+
+    future<> retry_loop();
+    void signal_retry_loop();
+    void reap_pending_retries();
+
+    // Dedicated syscall thread for this context's blocking io_submit() fallbacks.
+    std::unique_ptr<thread_pool> _aio_thread_pool;
+
+public:
+    explicit aio_storage_context(reactor& r);
+    ~aio_storage_context();
+
+    bool reap_completions();
+    bool submit_work();
+    bool can_sleep() const;
+    future<> stop() noexcept;
+
+    thread_pool* aio_thread_pool() noexcept { return _aio_thread_pool.get(); }
+};
+
+class completion_with_iocb {
+    bool _in_context = false;
+    internal::linux_abi::iocb _iocb;
+protected:
+    completion_with_iocb(int fd, int events, void* user_data);
+    void completed() {
+        _in_context = false;
+    }
+public:
+    void maybe_queue(aio_general_context& context);
+};
+
+class fd_kernel_completion : public kernel_completion {
+protected:
+    file_desc& _fd;
+    fd_kernel_completion(file_desc& fd) : _fd(fd) {}
+public:
+    file_desc& fd() {
+        return _fd;
+    }
+};
+
+struct hrtimer_aio_completion : public fd_kernel_completion,
+                                public completion_with_iocb {
+private:
+    reactor& _r;
+public:
+    hrtimer_aio_completion(reactor& r, file_desc& fd);
+    virtual void complete_with(ssize_t value) override;
+};
+
+struct task_quota_aio_completion : public fd_kernel_completion,
+                                   public completion_with_iocb {
+    task_quota_aio_completion(file_desc& fd);
+    virtual void complete_with(ssize_t value) override;
+};
+
+struct smp_wakeup_aio_completion : public fd_kernel_completion,
+                                   public completion_with_iocb {
+    smp_wakeup_aio_completion(file_desc& fd);
+    virtual void complete_with(ssize_t value) override;
+};
+
+// Common aio-based Implementation of the task quota and hrtimer.
+class preempt_io_context {
+    reactor& _r;
+    aio_general_context _context{2};
+
+    task_quota_aio_completion _task_quota_aio_completion;
+    hrtimer_aio_completion _hrtimer_aio_completion;
+public:
+    preempt_io_context(reactor& r, file_desc& task_quota, file_desc& hrtimer);
+    bool service_preempting_io();
+
+    size_t flush() {
+        return _context.flush();
+    }
+
+    void reset_preemption_monitor();
+    void request_preemption();
+    void start_tick();
+    void stop_tick();
+};
+
+// The "reactor_backend" interface provides a method of waiting for various
+// basic events on one thread. We have one implementation based on epoll and
+// file-descriptors (reactor_backend_epoll), one implementation based on
+// linux aio, and one implementation based on io_uring.
+class reactor_backend {
+protected:
+    using uses_blocking_io = bool_class<struct uses_blocking_io_tag>;
+    using supports_aio_fdatasync = bool_class<struct supports_aio_fdatasync_tag>;
+
+private:
+    const uses_blocking_io _blocking_io;
+    const supports_aio_fdatasync _aio_fdatasync;
+
+public:
+    virtual ~reactor_backend() {};
+    virtual std::string_view get_backend_name() const = 0;
+    // The methods below are used to communicate with the kernel.
+    // reap_kernel_completions() will complete any previous async
+    // work that is ready to consume.
+    // kernel_submit_work() submit new events that were produced.
+    // Both of those methods are asynchronous and will never block.
+    //
+    // wait_and_process_events on the other hand may block, and is called when
+    // we are about to go to sleep.
+    virtual bool reap_kernel_completions() = 0;
+    virtual bool kernel_submit_work() = 0;
+    virtual bool kernel_events_can_sleep() const = 0;
+    virtual void wait_and_process_events(const sigset_t* active_sigmask = nullptr) = 0;
+
+    // Methods that allow polling on file descriptors. This will only work on
+    // reactor_backend_epoll. Other reactor_backend will probably abort if
+    // they are called (which is fine if no file descriptors are waited on):
+    virtual future<> readable(pollable_fd_state& fd) = 0;
+    virtual future<> writeable(pollable_fd_state& fd) = 0;
+    virtual future<> readable_or_writeable(pollable_fd_state& fd) = 0;
+    virtual future<> poll_rdhup(pollable_fd_state& fd) = 0;
+    virtual void forget(pollable_fd_state& fd) noexcept = 0;
+
+    virtual future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd) = 0;
+    virtual future<> connect(pollable_fd_state& fd, socket_address& sa) = 0;
+    virtual future<size_t> read(pollable_fd_state& fd, void* buffer, size_t len) = 0;
+    virtual future<size_t> recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) = 0;
+    virtual future<temporary_buffer<char>> read_some(pollable_fd_state& fd, internal::buffer_allocator* ba) = 0;
+    // The iovec array backing the span, as well as the memory the iovecs
+    // point at, are borrowed: they must remain valid and unmodified until the
+    // returned future resolves.
+    virtual future<size_t> sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) = 0;
+    // The iovec array backing the span, as well as the memory the iovecs
+    // point at, are borrowed: they must remain valid and unmodified until the
+    // returned future resolves.
+    virtual future<size_t> writev(pollable_fd_state& fd, std::span<iovec> iovs) = 0;
+#if SEASTAR_API_LEVEL < 9
+    virtual future<size_t> send(pollable_fd_state& fd, const void* buffer, size_t len) = 0;
+#endif
+    virtual future<temporary_buffer<char>> recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba) = 0;
+
+    bool do_blocking_io() const noexcept {
+        return bool(_blocking_io);
+    }
+    bool have_aio_fdatasync() const noexcept {
+        return bool(_aio_fdatasync);
+    }
+    virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) = 0;
+    virtual void start_tick() = 0;
+    virtual void stop_tick() = 0;
+    virtual void arm_highres_timer(const ::itimerspec& ts) = 0;
+    virtual void reset_preemption_monitor() = 0;
+    virtual void request_preemption() = 0;
+    virtual void start_handling_signal() = 0;
+
+    virtual pollable_fd_state_ptr make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) = 0;
+
+    // Some backends create and manage their own thread pool for aio fallbacks.
+    // This should return a pointer to one if it exists, or nullptr otherwise.
+    virtual thread_pool* aio_thread_pool() noexcept { return nullptr; }
+
+protected:
+    reactor_backend(uses_blocking_io blocking_io, supports_aio_fdatasync aio_fdatasync)
+        : _blocking_io(blocking_io)
+        , _aio_fdatasync(aio_fdatasync)
+    {}
+};
+
+// reactor backend using file-descriptor & epoll, suitable for running on
+// Linux. Can wait on multiple file descriptors, and converts other events
+// (such as timers, signals, inter-thread notifications) into file descriptors
+// using mechanisms like timerfd, signalfd and eventfd respectively.
+class reactor_backend_epoll : public reactor_backend {
+    reactor& _r;
+    std::atomic<bool> _highres_timer_pending = {};
+    std::thread _task_quota_timer_thread;
+    ::itimerspec _steady_clock_timer_deadline = {};
+    // These two timers are used for high resolution timer<>s, one for
+    // the reactor thread (when sleeping) and one for the timer thread
+    // (when awake). We can't use one timer because of races between the
+    // timer thread and reactor thread.
+    //
+    // Only one of the two is active at any time.
+    file_desc _steady_clock_timer_reactor_thread;
+    file_desc _steady_clock_timer_timer_thread;
+    std::atomic<bool> _dying{false};
+private:
+    file_desc _epollfd;
+    void task_quota_timer_thread_fn();
+    future<> get_epoll_future(pollable_fd_state& fd, int event);
+    void complete_epoll_event(pollable_fd_state& fd, int events, int event);
+    aio_storage_context _storage_context;
+    void switch_steady_clock_timers(file_desc& from, file_desc& to);
+    void maybe_switch_steady_clock_timers(int timeout, file_desc& from, file_desc& to);
+    bool wait_and_process(int timeout, const sigset_t* active_sigmask);
+    bool complete_hrtimer();
+    bool _need_epoll_events = false;
+public:
+    explicit reactor_backend_epoll(reactor& r);
+    virtual ~reactor_backend_epoll() override;
+
+    virtual std::string_view get_backend_name() const override;
+    virtual bool reap_kernel_completions() override;
+    virtual bool kernel_submit_work() override;
+    virtual bool kernel_events_can_sleep() const override;
+    virtual void wait_and_process_events(const sigset_t* active_sigmask) override;
+    virtual future<> readable(pollable_fd_state& fd) override;
+    virtual future<> writeable(pollable_fd_state& fd) override;
+    virtual future<> readable_or_writeable(pollable_fd_state& fd) override;
+    virtual future<> poll_rdhup(pollable_fd_state& fd) override;
+    virtual void forget(pollable_fd_state& fd) noexcept override;
+
+    virtual future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd) override;
+    virtual future<> connect(pollable_fd_state& fd, socket_address& sa) override;
+    virtual future<size_t> read(pollable_fd_state& fd, void* buffer, size_t len) override;
+    virtual future<size_t> recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
+    virtual future<temporary_buffer<char>> read_some(pollable_fd_state& fd, internal::buffer_allocator* ba) override;
+    virtual future<size_t> sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) override;
+    virtual future<size_t> writev(pollable_fd_state& fd, std::span<iovec> iovs) override;
+#if SEASTAR_API_LEVEL < 9
+    virtual future<size_t> send(pollable_fd_state& fd, const void* buffer, size_t len) override;
+#endif
+    virtual future<temporary_buffer<char>> recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba) override;
+
+    virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) override;
+    virtual void start_tick() override;
+    virtual void stop_tick() override;
+    virtual void arm_highres_timer(const ::itimerspec& ts) override;
+    virtual void reset_preemption_monitor() override;
+    virtual void request_preemption() override;
+    virtual void start_handling_signal() override;
+
+    virtual pollable_fd_state_ptr
+    make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) override;
+
+    thread_pool* aio_thread_pool() noexcept override { return _storage_context.aio_thread_pool(); }
+};
+
+class reactor_backend_aio : public reactor_backend {
+    reactor& _r;
+    file_desc _hrtimer_timerfd;
+    aio_storage_context _storage_context;
+    // We use two aio contexts, one for preempting events (the timer tick and
+    // signals), the other for non-preempting events (fd poll).
+    preempt_io_context _preempting_io; // Used for the timer tick and the high resolution timer
+    aio_general_context _polling_io; // FIXME: unify with disk aio_context
+    hrtimer_aio_completion _hrtimer_poll_completion;
+    smp_wakeup_aio_completion _smp_wakeup_aio_completion;
+    static file_desc make_timerfd();
+    bool await_events(int timeout, const sigset_t* active_sigmask);
+    future<> poll(pollable_fd_state& fd, int events);
+public:
+    explicit reactor_backend_aio(reactor& r);
+
+    virtual std::string_view get_backend_name() const override;
+    virtual bool reap_kernel_completions() override;
+    virtual bool kernel_submit_work() override;
+    virtual bool kernel_events_can_sleep() const override;
+    virtual void wait_and_process_events(const sigset_t* active_sigmask) override;
+    virtual future<> readable(pollable_fd_state& fd) override;
+    virtual future<> writeable(pollable_fd_state& fd) override;
+    virtual future<> readable_or_writeable(pollable_fd_state& fd) override;
+    virtual future<> poll_rdhup(pollable_fd_state& fd) override;
+    virtual void forget(pollable_fd_state& fd) noexcept override;
+
+    virtual future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd) override;
+    virtual future<> connect(pollable_fd_state& fd, socket_address& sa) override;
+    virtual future<size_t> read(pollable_fd_state& fd, void* buffer, size_t len) override;
+    virtual future<size_t> recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
+    virtual future<temporary_buffer<char>> read_some(pollable_fd_state& fd, internal::buffer_allocator* ba) override;
+    virtual future<size_t> sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) override;
+    virtual future<size_t> writev(pollable_fd_state& fd, std::span<iovec> iovs) override;
+#if SEASTAR_API_LEVEL < 9
+    virtual future<size_t> send(pollable_fd_state& fd, const void* buffer, size_t len) override;
+#endif
+    virtual future<temporary_buffer<char>> recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba) override;
+
+    virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) override;
+    virtual void start_tick() override;
+    virtual void stop_tick() override;
+    virtual void arm_highres_timer(const ::itimerspec& its) override;
+    virtual void reset_preemption_monitor() override;
+    virtual void request_preemption() override;
+    virtual void start_handling_signal() override;
+
+    virtual pollable_fd_state_ptr
+    make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) override;
+
+    thread_pool* aio_thread_pool() noexcept override { return _storage_context.aio_thread_pool(); }
+};
+
+class reactor_backend_uring;
+class reactor_backend_asymmetric_uring;
+class reactor_backend_configurator;
+
+class reactor_backend_selector {
+    std::string _name;
+private:
+    static bool has_enough_aio_nr();
+    explicit reactor_backend_selector(std::string name) : _name(std::move(name)) {}
+public:
+    const std::string& name() const { return _name; }
+    std::unique_ptr<reactor_backend> create(reactor& r);
+    static reactor_backend_selector default_backend();
+    static std::vector<reactor_backend_selector> available();
+    friend std::ostream& operator<<(std::ostream& os, const reactor_backend_selector& rbs) {
+        return os << rbs._name;
+    }
+    std::shared_ptr<reactor_backend_configurator> configurator(resource::cpuset cpu_set, const reactor_options& reactor_opts, const smp_options& smp_opts) const;
+};
+
+class reactor_backend_configurator {
+public:
+    virtual const resource::cpuset& configured_cpuset() const = 0;
+    virtual void verify_allocations(const std::vector<resource::cpu>& allocations) const = 0;
+    virtual void initialize_shard_configuration_and_topology(shard_id id, const std::vector<resource::cpu>& allocations) = 0;
+    virtual void initialize_shard_configuration(shard_id id) = 0;
+    virtual reactor_config finalize_apply_shard_configuration(shard_id id, reactor_config cfg) = 0;
+    virtual ~reactor_backend_configurator() = default;
+};
+
+namespace uring {
+    struct numa_assignment;
+}
+
+#ifdef SEASTAR_HAVE_URING
+
+/// Helper functions that manage the lifecycle and configuration of asymmetric io_uring backend
+/// Handles CPU allocation, worker thread management, and backend creation
+namespace uring {
+
+std::optional<::io_uring>
+try_create_attached_asymmetric_uring(int uring_fd, bool throw_on_error);
+
+std::optional<::io_uring>
+try_create_base_asymmetric_uring(unsigned worker_cpu, bool throw_on_error);
+
+struct numa_assignment {
+    unsigned networking_core;
+    unsigned networking_group;
+    bool is_master;
+};
+
+std::shared_ptr<std::vector<numa_assignment>> compute_assignments(const std::vector<resource::cpu>& allocations, const resource::cpuset& networking_cores);
+
+// QUEUE_LEN is more or less arbitrary. Too low and we'll be
+// issuing too small batches, too high and we require too much locked
+// memory, but otherwise it doesn't matter.
+inline constexpr unsigned QUEUE_LEN = 200;
+inline constexpr std::chrono::milliseconds POLLER_SLEEP_TIMEOUT(5);
+
+} // namespace uring
+
+#endif // SEASTAR_HAVE_URING
+
+}
+
+
+template <> struct fmt::formatter<seastar::reactor_backend_selector> : fmt::ostream_formatter {};
+

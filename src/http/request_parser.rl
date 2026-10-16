@@ -1,0 +1,228 @@
+/*
+ * This file is open source software, licensed to you under the terms
+ * of the Apache License, Version 2.0 (the "License").  See the NOTICE file
+ * distributed with this work for additional information regarding copyright
+ * ownership.  You may not use this file except in compliance with the License.
+ *
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+/*
+ * Copyright (C) 2014 Cloudius Systems, Ltd.
+ */
+
+#pragma once
+
+#include <seastar/core/ragel.hh>
+#include <limits>
+#include <memory>
+#include <unordered_map>
+#include <seastar/http/request.hh>
+
+namespace seastar {
+
+%% machine request;
+
+%%{
+
+access _fsm_;
+# alphtype + getkey: workaround for #3413
+alphtype unsigned char;
+getkey ((unsigned char)(*p));
+
+action mark {
+    g.mark_start(p);
+}
+
+action store_method {
+    _req->_method = str();
+}
+
+action store_uri {
+    _req->_url = str();
+}
+
+action store_version {
+    _req->_version = str();
+}
+
+action mark_request_line_end {
+    // Absolute byte offset of the end of the request line, so an oversized
+    // request can be attributed to the URI (414) vs the header fields (431).
+    _request_line_size = _parsed_size + (p - start);
+}
+
+action store_field_name {
+    _field_name = str();
+}
+
+action store_value {
+    _value = str();
+}
+
+action trim_trailing_whitespace_and_store_value {
+    _value = str();
+    trim_trailing_spaces_and_tabs(_value);
+    g.mark_start(nullptr);
+}
+
+action assign_field {
+    auto [iter, inserted] = _req->_headers.try_emplace(_field_name, std::move(_value));
+    if (!inserted) {
+        // RFC 7230, section 3.2.2.  Field Parsing:
+        // A recipient MAY combine multiple header fields with the same field name into one
+        // "field-name: field-value" pair, without changing the semantics of the message,
+        // by appending each subsequent field value to the combined field value in order, separated by a comma.
+        iter->second += sstring(",") + std::move(_value);
+    }
+}
+
+action extend_field  {
+    // RFC 7230, section 3.2.4.  Field Order:
+    // A server that receives an obs-fold in a request message that is not
+    // within a message/http container MUST either reject the message [...]
+    // or replace each received obs-fold with one or more SP octets [...]
+    _req->_headers[_field_name] += sstring(" ") + std::move(_value);
+}
+
+action done {
+    done = true;
+    fbreak;
+}
+
+crlf = '\r\n';
+tchar = alpha | digit | '-' | '!' | '#' | '$' | '%' | '&' | '\'' | '*'
+        | '+' | '.' | '^' | '_' | '`' | '|' | '~';
+
+sp = ' ';
+ht = '\t';
+
+sp_ht = sp | ht;
+
+op_char = upper;
+
+operation = op_char+ >mark %store_method;
+uri = (any - sp)+ >mark %store_uri;
+http_version = 'HTTP/' (digit '.' digit) >mark %store_version;
+
+obs_text = 0x80..0xFF; # defined in RFC 7230, Section 3.2.6.
+field_vchar = (graph | obs_text);
+# RFC 9110, Section 5.5 allows single ' '/'\t' separators between
+# field_vchar words. We are less strict and allow any number of spaces
+# between words.
+# Trailing spaces are trimmed in postprocessing.
+field_content = (field_vchar | sp_ht)*;
+
+field = tchar+ >mark %store_field_name;
+value = field_content >mark %trim_trailing_whitespace_and_store_value;
+start_line = ((operation sp uri sp http_version) -- crlf) crlf %mark_request_line_end;
+header_1st = (field ':' sp_ht* <: value crlf) %assign_field;
+header_cont = (sp_ht+ <: value crlf) %extend_field;
+header = header_1st header_cont*;
+main := start_line header* (crlf @done);
+
+}%%
+
+class http_request_parser : public ragel_parser_base<http_request_parser> {
+    %% write data nofinal noprefix;
+public:
+    enum class state {
+        error,
+        eof,
+        done,
+        too_large,
+    };
+    std::unique_ptr<http::request> _req;
+    sstring _field_name;
+    sstring _value;
+    state _state;
+    size_t _size_limit = std::numeric_limits<size_t>::max();
+    size_t _parsed_size = 0;
+    size_t _request_line_size = 0;
+public:
+    void init() {
+        init_base();
+        _req.reset(new http::request());
+        _state = state::eof;
+        _parsed_size = 0;
+        _request_line_size = 0;
+        %% write init;
+    }
+    void set_size_limit(size_t limit) {
+        _size_limit = limit;
+    }
+    char* parse(char* p, char* pe, char* eof) {
+        char* start = p;
+        sstring_builder::guard g(_builder, p, pe);
+        [[maybe_unused]] auto str = [this, &g, &p] { g.mark_end(p); return get_str(); };
+        bool done = false;
+        if (p != pe) {
+            _state = state::error;
+        }
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wmisleading-indentation"
+#endif
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+        %% write exec;
+#pragma GCC diagnostic pop
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+        if (!done) {
+            if (p == eof) {
+                _state = state::eof;
+            } else if (p != pe) {
+                _state = state::error;
+            } else {
+                p = nullptr;
+            }
+        } else {
+            _state = state::done;
+        }
+        // Bound the request line and headers so a client can't force the server
+        // to buffer unbounded memory before the handler runs (issue #2698).
+        _parsed_size += (p ? p : pe) - start;
+        if (_state != state::error && _parsed_size > _size_limit) {
+            _state = state::too_large;
+            if (!p) {
+                p = pe;
+            }
+        }
+        return p;
+    }
+    auto get_parsed_request() {
+        return std::move(_req);
+    }
+    bool eof() const {
+        return _state == state::eof;
+    }
+    bool failed() const {
+        // An oversized request is a parse failure too, so callers only need to
+        // check failed() to know whether parsing succeeded; size_limit_exceeded()
+        // then tells them why, to pick the right HTTP status.
+        return _state == state::error || _state == state::too_large;
+    }
+    bool size_limit_exceeded() const {
+        return _state == state::too_large;
+    }
+    // Only meaningful when size_limit_exceeded(). True when the URI is what
+    // overflowed the limit -- either the request line never finished (still
+    // reading the URI) or the request line alone already exceeded the limit --
+    // as opposed to the header fields pushing the request over.
+    bool uri_too_large() const {
+        return _state == state::too_large &&
+                (_request_line_size == 0 || _request_line_size > _size_limit);
+    }
+};
+
+}

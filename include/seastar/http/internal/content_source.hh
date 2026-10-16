@@ -1,0 +1,277 @@
+/*
+ * This file is open source software, licensed to you under the terms
+ * of the Apache License, Version 2.0 (the "License").  See the NOTICE file
+ * distributed with this work for additional information regarding copyright
+ * ownership.  You may not use this file except in compliance with the License.
+ *
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+/*
+ * Copyright 2020 ScyllaDB
+ */
+
+#pragma once
+
+#include <seastar/http/chunk_parsers.hh>
+#include <seastar/core/format.hh>
+#include <seastar/core/iostream.hh>
+#include <seastar/core/temporary_buffer.hh>
+#include <seastar/http/common.hh>
+#include <seastar/http/exception.hh>
+
+#include <system_error>
+
+namespace seastar {
+
+namespace httpd {
+
+namespace internal {
+
+/*
+ * An input_stream wrapper that allows to read only "length" bytes
+ * from it, used to handle requests with large bodies.
+ * */
+class content_length_source_impl : public data_source_impl {
+    input_stream<char>& _inp;
+    /*
+     * The _remaining_bytes references the counter of yet unread body bytes.
+     * The external counter variable is provided by users that want to track
+     * this value. If it's not the case and the external counter is not provided,
+     * this reference points to _builtin_remaining_bytes member.
+     */
+    size_t _builtin_remaining_bytes = 0;
+    size_t& _remaining_bytes;
+    size_t _length;
+public:
+    content_length_source_impl(input_stream<char>& inp, size_t length, size_t& remaining)
+        : _inp(inp), _remaining_bytes(remaining), _length(length)
+    {
+        _remaining_bytes = length;
+    }
+
+    content_length_source_impl(input_stream<char>& inp, size_t length)
+        : _inp(inp), _builtin_remaining_bytes(length), _remaining_bytes(_builtin_remaining_bytes), _length(length) {
+    }
+
+    virtual future<temporary_buffer<char>> get() override {
+        if (_remaining_bytes == 0) {
+            return make_ready_future<temporary_buffer<char>>();
+        }
+        return _inp.read_up_to(_remaining_bytes).then([this] (temporary_buffer<char> tmp_buf) {
+            if (tmp_buf.empty()) {
+                // read_up_to() asked for a non-zero amount, so an empty buffer is
+                // end of stream and the body is not over yet. Answering it as a
+                // clean end of stream hands the reader a silently short body.
+                return make_exception_future<temporary_buffer<char>>(std::system_error(
+                        std::make_error_code(std::errc::protocol_error),
+                        format("Body ended with {} of its {} bytes undelivered", _remaining_bytes, _length)));
+            }
+            _remaining_bytes -= tmp_buf.size();
+            return make_ready_future<temporary_buffer<char>>(std::move(tmp_buf));
+        });
+    }
+
+    virtual future<temporary_buffer<char>> skip(uint64_t n) override {
+        uint64_t skip_bytes = std::min(n, _remaining_bytes);
+        _remaining_bytes -= skip_bytes;
+        return _inp.skip(skip_bytes).then([] {
+            return temporary_buffer<char>();
+        });
+    }
+
+    virtual future<> close() override {
+        return make_ready_future<>();
+    }
+};
+
+/*
+ * An input_stream wrapper that decodes a request body
+ * with "chunked" encoding.
+ * */
+class chunked_source_impl : public data_source_impl {
+    class chunk_parser {
+        enum class parsing_state
+            : uint8_t {
+                size_and_ext,
+                body,
+                trailer_part
+        };
+        http_chunk_size_and_ext_parser _size_and_ext_parser;
+        http_chunk_trailer_parser _trailer_parser;
+
+        temporary_buffer<char> _buf;
+        size_t _current_chunk_bytes_read = 0;
+        size_t _current_chunk_length;
+        parsing_state _ps = parsing_state::size_and_ext;
+        bool _end_of_request = false;
+        // references to fields in the request structure
+        std::unordered_map<sstring, sstring>& _chunk_extensions;
+        std::unordered_map<sstring, sstring>& _trailing_headers;
+        /*
+         * Reference to the counter of yet unread body bytes, similar to the one
+         * from content_length_source_impl. Similarly, when the external counter is
+         * not provided it points to the _builtin_remaining_bytes, which sits on the
+         * chunked_source_impl itself, not in the chunk_parser.
+         *
+         * This counter differs from the content_length_source_impl one -- since body
+         * size is not known for chunked body, this counter has only two values. It
+         * starts with uint64_t::max and remains such up until all the body is read.
+         * Once end-of-body is met, the counter is reset to zero.
+         */
+        size_t& _remaining_bytes;
+        using consumption_result_type = consumption_result<char>;
+    public:
+        chunk_parser(std::unordered_map<sstring, sstring>& chunk_extensions, std::unordered_map<sstring, sstring>& trailing_headers, size_t& remaining)
+            : _chunk_extensions(chunk_extensions), _trailing_headers(trailing_headers), _remaining_bytes(remaining) {
+                _remaining_bytes = std::numeric_limits<size_t>::max();
+                _size_and_ext_parser.init();
+        }
+        temporary_buffer<char> buf() {
+            _current_chunk_bytes_read += _buf.size();
+            return std::move(_buf);
+        }
+
+        future<consumption_result_type> operator()(temporary_buffer<char> data) {
+            if (_buf.size() || _end_of_request) {
+                // return if we have already read some content (_buf.size()), or we have
+                // already reached the end of the chunked request (_end_of_request)
+                return make_ready_future<consumption_result_type>(stop_consuming(std::move(data)));
+            }
+            if (data.empty()) {
+                // consume() only hands over an empty buffer at end of stream, and the
+                // terminating chunk has not been seen, so the body was cut short.
+                return make_exception_future<consumption_result_type>(std::system_error(
+                        std::make_error_code(std::errc::protocol_error), "Chunked body ended before its last chunk"));
+            }
+            switch (_ps) {
+            // "data" buffer is non-empty
+            case parsing_state::size_and_ext:
+                return _size_and_ext_parser(std::move(data)).then([this] (consumption_result_type res) {
+                    if (auto* stop = std::get_if<stop_consuming<char>>(&res.get())) {
+                        if (_size_and_ext_parser.failed()) {
+                            return make_exception_future<consumption_result_type>(bad_request_exception("Can't parse chunk size and extensions"));
+                        }
+                        // save extensions
+                        auto parsed_extensions = _size_and_ext_parser.get_parsed_extensions();
+                        _chunk_extensions.merge(parsed_extensions);
+                        for (auto& key_val : parsed_extensions) {
+                            _chunk_extensions[key_val.first] += sstring(",") + key_val.second;
+                        }
+
+                        // save size
+                        auto size_string = _size_and_ext_parser.get_size();
+                        if (size_string.size() > 16) {
+                            return make_exception_future<consumption_result_type>(bad_chunk_exception("Chunk length too big"));
+                        }
+                        _current_chunk_bytes_read = 0;
+                        _current_chunk_length = strtol(size_string.c_str(), nullptr, 16);
+
+                        if (_current_chunk_length == 0) {
+                            _ps = parsing_state::trailer_part;
+                            _trailer_parser.init();
+                        } else {
+                            _ps = parsing_state::body;
+                        }
+                        if (stop->get_buffer().empty()) {
+                            return make_ready_future<consumption_result_type>(continue_consuming{});
+                        }
+                        return this->operator()(std::move(stop->get_buffer()));
+                    } else {
+                        return make_ready_future<consumption_result_type>(continue_consuming{});
+                    }
+                });
+            case parsing_state::body:
+                // read the new data into _buf
+                if (_current_chunk_bytes_read < _current_chunk_length) {
+                    size_t to_read = std::min(_current_chunk_length - _current_chunk_bytes_read, data.size());
+                    if (_buf.empty()) {
+                        _buf = data.share(0, to_read);
+                    }
+                    data.trim_front(to_read);
+                    return make_ready_future<consumption_result_type>(stop_consuming(std::move(data)));
+                }
+
+                // chunk body is finished, we haven't entered the previous if, so "data" is still non-empty
+                if (_current_chunk_bytes_read == _current_chunk_length) {
+                    // we haven't read \r yet
+                    if (data.get()[0] != '\r') {
+                        return make_exception_future<consumption_result_type>(bad_chunk_exception("The actual chunk length exceeds the specified length"));
+                    } else {
+                        _current_chunk_bytes_read++;
+                        data.trim_front(1);
+                        if (data.empty()) {
+                            return make_ready_future<consumption_result_type>(continue_consuming{});
+                        }
+                    }
+                }
+                if (_current_chunk_bytes_read == _current_chunk_length + 1) {
+                    // we haven't read \n but have \r
+                    if (data.get()[0] != '\n') {
+                        return make_exception_future<consumption_result_type>(bad_chunk_exception("The actual chunk length exceeds the specified length"));
+                    } else {
+                        _ps = parsing_state::size_and_ext;
+                        _size_and_ext_parser.init();
+                        data.trim_front(1);
+                        if (data.empty()) {
+                            return make_ready_future<consumption_result_type>(continue_consuming{});
+                        }
+                    }
+                }
+                return this->operator()(std::move(data));
+            case parsing_state::trailer_part:
+                return _trailer_parser(std::move(data)).then([this] (consumption_result_type res) {
+                    if (auto* stop = std::get_if<stop_consuming<char>>(&res.get())) {
+                        if (_trailer_parser.failed()) {
+                            return make_exception_future<consumption_result_type>(bad_request_exception("Can't parse chunked request trailer"));
+                        }
+                        // save trailing headers
+                        _trailing_headers = _trailer_parser.get_parsed_headers();
+                        _end_of_request = true;
+                        _remaining_bytes = 0;
+                        return make_ready_future<consumption_result_type>(std::move(*stop));
+                    } else {
+                        return make_ready_future<consumption_result_type>(continue_consuming{});
+                    }
+                });
+            }
+            __builtin_unreachable();
+        }
+    };
+    input_stream<char>& _inp;
+    chunk_parser _chunk;
+    size_t _builtin_remaining_bytes = 0;
+
+public:
+    chunked_source_impl(input_stream<char>& inp, std::unordered_map<sstring, sstring>& chunk_extensions, std::unordered_map<sstring, sstring>& trailing_headers, size_t& remaining)
+        : _inp(inp), _chunk(chunk_extensions, trailing_headers, remaining) {
+    }
+
+    chunked_source_impl(input_stream<char>& inp, std::unordered_map<sstring, sstring>& chunk_extensions, std::unordered_map<sstring, sstring>& trailing_headers)
+        : _inp(inp), _chunk(chunk_extensions, trailing_headers, _builtin_remaining_bytes) {
+    }
+
+    virtual future<temporary_buffer<char>> get() override {
+        return _inp.consume(_chunk).then([this] () mutable {
+            return _chunk.buf();
+        });
+    }
+
+    virtual future<> close() override {
+        return make_ready_future<>();
+    }
+};
+
+} // namespace internal
+
+} // namespace httpd
+
+}

@@ -1,0 +1,647 @@
+/*
+ * This file is open source software, licensed to you under the terms
+ * of the Apache License, Version 2.0 (the "License").  See the NOTICE file
+ * distributed with this work for additional information regarding copyright
+ * ownership.  You may not use this file except in compliance with the License.
+ *
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/*
+ * Copyright (C) 2015 Cloudius Systems, Ltd.
+ */
+
+
+#pragma once
+
+#include <algorithm>
+#include <numeric>
+#include <stdexcept>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/do_with.hh>
+#include <seastar/core/loop.hh>
+#include <seastar/net/packet.hh>
+#include <seastar/util/assert.hh>
+#include <seastar/util/variant_utils.hh>
+
+namespace seastar {
+
+inline future<temporary_buffer<char>> data_source_impl::skip(uint64_t n)
+{
+    return do_with(uint64_t(n), [this] (uint64_t& n) {
+        return repeat_until_value([&] {
+            return get().then([&] (temporary_buffer<char> buffer)
+                    -> future<std::optional<temporary_buffer<char>>> {
+                using opt_buf = std::optional<temporary_buffer<char>>;
+                if (buffer.empty()) {
+                    return make_exception_future<opt_buf>(
+                            std::runtime_error("premature end of stream"));
+                }
+                if (buffer.size() >= n) {
+                    buffer.trim_front(n);
+                    return make_ready_future<opt_buf>(std::move(buffer));
+                }
+                n -= buffer.size();
+                return make_ready_future<opt_buf>(std::nullopt);
+            });
+        });
+    });
+}
+
+template<typename CharType>
+inline
+future<> output_stream<CharType>::write(const char_type* buf) noexcept {
+    return write(buf, strlen(buf));
+}
+
+template<typename CharType>
+template<typename StringChar, typename SizeType, SizeType MaxSize, bool NulTerminate>
+inline
+future<> output_stream<CharType>::write(const basic_sstring<StringChar, SizeType, MaxSize, NulTerminate>& s) noexcept {
+    return write(reinterpret_cast<const CharType *>(s.c_str()), s.size());
+}
+
+template<typename CharType>
+inline
+future<> output_stream<CharType>::write(const std::basic_string<CharType>& s) noexcept {
+    return write(s.c_str(), s.size());
+}
+
+template<typename CharType>
+future<>
+output_stream<CharType>::zero_copy_put(std::vector<temporary_buffer<CharType>> b) noexcept {
+    // if flush is scheduled, disable it, so it will not try to write in parallel
+    _flush = false;
+    if (_flushing) {
+        // flush in progress, wait for it to end before continuing
+        return _in_batch.value().get_future().then([this, b = std::move(b)] () mutable {
+            return _fd.put(std::move(b));
+        });
+    } else {
+        return _fd.put(std::move(b));
+    }
+}
+
+// Writes @p in chunks of _buffer_size length. The last chunk is buffered if smaller.
+template <typename CharType>
+future<>
+output_stream<CharType>::zero_copy_split_and_put(std::vector<temporary_buffer<CharType>> b, size_t len) noexcept {
+    return repeat([this, b = std::move(b), len] () mutable {
+        if (len < _buffer_size) {
+            _zc_bufs = std::move(b);
+            _zc_len = len;
+            return make_ready_future<stop_iteration>(stop_iteration::yes);
+        }
+        auto chunk = internal::detach_front(b, _buffer_size);
+        len -= _buffer_size;
+        return zero_copy_put(std::move(chunk)).then([] {
+            return stop_iteration::no;
+        });
+    });
+}
+
+template<typename CharType>
+future<> output_stream<CharType>::write(std::span<temporary_buffer<CharType>> bufs) noexcept {
+    static_assert(std::is_same_v<CharType, char>, "packet works on char");
+  try {
+    size_t size = std::accumulate(bufs.begin(), bufs.end(), size_t(0), [] (size_t s, const auto& b) { return s + b.size(); });
+    if (size != 0) {
+        if (_end) {
+            // Seal the filled prefix as a shared view into _buf, then
+            // advance _buf past it so the same allocation can be reused
+            // for future buffered writes after this zero-copy sequence.
+            _zc_bufs.emplace_back(_buf.share(0, _end));
+            _buf.trim_front(_end);
+            if (!_buf.size()) {
+                _buf = {};
+            }
+            _zc_len += _end;
+            _end = 0;
+        }
+
+        _zc_len += size;
+        _zc_bufs.insert(_zc_bufs.end(), std::make_move_iterator(bufs.begin()), std::make_move_iterator(bufs.end()));
+        if (_zc_len >= _buffer_size) {
+            if (_trim_to_size) {
+                return zero_copy_split_and_put(std::move(_zc_bufs), std::exchange(_zc_len, 0));
+            } else {
+                _zc_len = 0;
+                return zero_copy_put(std::move(_zc_bufs));
+            }
+        }
+    }
+    return make_ready_future<>();
+  } catch (...) {
+    return current_exception_as_future();
+  }
+}
+
+template<typename CharType>
+future<> output_stream<CharType>::write(temporary_buffer<CharType> p) noexcept {
+  try {
+    return write(std::span<temporary_buffer<CharType>>(&p, 1));
+  } catch (...) {
+    return current_exception_as_future();
+  }
+}
+
+#if SEASTAR_API_LEVEL < 9
+template<typename CharType>
+future<> output_stream<CharType>::write(net::packet p) noexcept {
+    try {
+        std::vector<temporary_buffer<CharType>> bufs = std::move(p).release();
+        return write(std::span<temporary_buffer<CharType>>(bufs));
+    } catch (...) {
+        return current_exception_as_future();
+    }
+}
+
+template<typename CharType>
+future<> output_stream<CharType>::write(scattered_message<CharType> msg) noexcept {
+    return write(std::move(msg).release());
+}
+#endif
+
+template <typename CharType>
+future<temporary_buffer<CharType>>
+input_stream<CharType>::read_exactly_part(size_t n) noexcept {
+    temporary_buffer<CharType> out(n);
+    size_t completed{0U};
+    while (completed < n) {
+        size_t avail = available();
+        if (avail) {
+            auto now = std::min(n - completed, avail);
+            std::copy_n(_buf.get(), now, out.get_write() + completed);
+            _buf.trim_front(now);
+            completed += now;
+            if (completed == n) {
+                break;
+            }
+        }
+
+        // _buf is now empty
+        temporary_buffer<CharType> buf = co_await _fd.get();
+        if (buf.size() == 0) {
+            _eof = true;
+            out.trim(completed);
+            break;
+        }
+        _buf = std::move(buf);
+    }
+    co_return out;
+}
+
+template <typename CharType>
+future<temporary_buffer<CharType>>
+input_stream<CharType>::read_exactly(size_t n) noexcept {
+    if (_buf.size() == n) {
+        // easy case: steal buffer, return to caller
+        return make_ready_future<tmp_buf>(std::move(_buf));
+    } else if (_buf.size() > n) {
+        // buffer large enough, share it with caller
+        auto front = _buf.share(0, n);
+        _buf.trim_front(n);
+        return make_ready_future<tmp_buf>(std::move(front));
+    } else if (_buf.size() == 0) {
+        // buffer is empty: if already at EOF return empty, otherwise grab one and retry
+        if (_eof) {
+            return make_ready_future<tmp_buf>();
+        }
+        return _fd.get().then([this, n] (auto buf) mutable {
+            if (buf.size() == 0) {
+                _eof = true;
+                return make_ready_future<tmp_buf>(std::move(buf));
+            }
+            _buf = std::move(buf);
+            return this->read_exactly(n);
+        });
+    } else {
+        // buffer too small: start copy/read loop
+        return read_exactly_part(n);
+    }
+}
+
+template <typename CharType>
+template <typename Consumer>
+requires InputStreamConsumer<Consumer, CharType> || ObsoleteInputStreamConsumer<Consumer, CharType>
+future<>
+input_stream<CharType>::consume(Consumer&& consumer) noexcept(std::is_nothrow_move_constructible_v<Consumer>) {
+    return repeat([consumer = std::move(consumer), this] () mutable {
+        if (_buf.empty() && !_eof) {
+            return _fd.get().then([this] (tmp_buf buf) {
+                _buf = std::move(buf);
+                _eof = _buf.empty();
+                return make_ready_future<stop_iteration>(stop_iteration::no);
+            });
+        }
+        return consumer(std::move(_buf)).then([this] (consumption_result_type result) {
+            return seastar::visit(result.get(), [this] (const continue_consuming&) {
+               // If we're here, consumer consumed entire buffer and is ready for
+                // more now. So we do not return, and rather continue the loop.
+                //
+                // If we're at eof, we should stop.
+                return make_ready_future<stop_iteration>(stop_iteration(this->_eof));
+            }, [this] (stop_consuming<CharType>& stop) {
+                // consumer is done
+                this->_buf = std::move(stop.get_buffer());
+                return make_ready_future<stop_iteration>(stop_iteration::yes);
+            }, [this] (const skip_bytes& skip) {
+                return this->_fd.skip(skip.get_value()).then([this](tmp_buf buf) {
+                    if (!buf.empty()) {
+                        this->_buf = std::move(buf);
+                    }
+                    return make_ready_future<stop_iteration>(stop_iteration::no);
+                });
+            });
+        });
+    });
+}
+
+template <typename CharType>
+template <typename Consumer>
+requires InputStreamConsumer<Consumer, CharType> || ObsoleteInputStreamConsumer<Consumer, CharType>
+future<>
+input_stream<CharType>::consume(Consumer& consumer) noexcept(std::is_nothrow_move_constructible_v<Consumer>) {
+    return consume(std::ref(consumer));
+}
+
+template <typename CharType>
+future<temporary_buffer<CharType>>
+input_stream<CharType>::read_up_to(size_t n) noexcept {
+    if (_buf.empty()) {
+        if (_eof) {
+            return make_ready_future<tmp_buf>();
+        } else {
+            return _fd.get().then([this, n] (tmp_buf buf) {
+                _eof = buf.empty();
+                _buf = std::move(buf);
+                return read_up_to(n);
+            });
+        }
+    } else if (_buf.size() <= n) {
+        // easy case: steal buffer, return to caller
+        return make_ready_future<tmp_buf>(std::move(_buf));
+    } else {
+      try {
+        // buffer is larger than n, so share its head with a caller
+        auto front = _buf.share(0, n);
+        _buf.trim_front(n);
+        return make_ready_future<tmp_buf>(std::move(front));
+      } catch (...) {
+        return current_exception_as_future<tmp_buf>();
+      }
+    }
+}
+
+template <typename CharType>
+future<temporary_buffer<CharType>>
+input_stream<CharType>::read() noexcept {
+    if (_eof) {
+        return make_ready_future<tmp_buf>();
+    }
+    if (_buf.empty()) {
+        return _fd.get().then([this] (tmp_buf buf) {
+            _eof = buf.empty();
+            return make_ready_future<tmp_buf>(std::move(buf));
+        });
+    } else {
+        return make_ready_future<tmp_buf>(std::move(_buf));
+    }
+}
+
+template <typename CharType>
+future<>
+input_stream<CharType>::skip(uint64_t n) noexcept {
+    auto skip_buf = std::min(static_cast<size_t>(n), _buf.size());
+    _buf.trim_front(skip_buf);
+    n -= skip_buf;
+    if (!n) {
+        return make_ready_future<>();
+    }
+    if (_eof) {
+        return make_exception_future<>(std::runtime_error("premature end of stream"));
+    }
+    return _fd.skip(n).then([this] (temporary_buffer<CharType> buffer) {
+        _buf = std::move(buffer);
+    });
+}
+
+template <typename CharType>
+data_source
+input_stream<CharType>::detach() && {
+    if (_buf) {
+        throw std::logic_error("detach() called on a used input_stream");
+    }
+
+    return std::move(_fd);
+}
+
+// Writes @buf in chunks of _buffer_size length. The last chunk is buffered if smaller.
+template <typename CharType>
+future<>
+output_stream<CharType>::split_and_put(temporary_buffer<CharType> buf) noexcept {
+    SEASTAR_ASSERT(_end == 0);
+
+    return repeat([this, buf = std::move(buf)] () mutable {
+        if (buf.size() < _buffer_size) {
+            if (!_buf || _buf.size() < buf.size()) {
+                // _buf is absent or a trim_front'd remnant whose remaining
+                // capacity is smaller than the tail we need to store. We
+                // allocate a fresh buffer and abandon the remnant. The unused
+                // bytes of the remnant's underlying allocation are not leaked
+                // (the allocation is freed once all shared references to it are
+                // dropped), but they are wasted and will never be written to.
+                // This is a deliberate trade-off: filling the remnant partially
+                // and then copying the rest into a new buffer would require an
+                // async put() here, complicating the code with no clear benefit.
+                _buf = _fd.allocate_buffer(_buffer_size);
+            }
+            std::copy(buf.get(), buf.get() + buf.size(), _buf.get_write());
+            _end = buf.size();
+            return make_ready_future<stop_iteration>(stop_iteration::yes);
+        }
+        auto chunk = buf.share(0, _buffer_size);
+        buf.trim_front(_buffer_size);
+        return put(std::move(chunk)).then([] {
+            return stop_iteration::no;
+        });
+    });
+}
+
+template <typename CharType>
+future<>
+output_stream<CharType>::write(const char_type* buf, size_t n) noexcept {
+    if (__builtin_expect(!_buf || n > _buf.size() - _end, false)) {
+        return slow_write(buf, n);
+    }
+    std::copy_n(buf, n, _buf.get_write() + _end);
+    _end += n;
+    return make_ready_future<>();
+}
+
+template <typename CharType>
+future<>
+output_stream<CharType>::slow_write(const char_type* buf, size_t n) noexcept {
+    try {
+        if (!_end && (n >= _buffer_size)) {
+            temporary_buffer<char> tmp = _fd.allocate_buffer(n);
+            std::copy(buf, buf + n, tmp.get_write());
+            if (!_zc_bufs.empty()) {
+                // No buffered data yet, but zero-copy data is pending.
+                // Append to _zc_bufs so ordering is preserved.
+                _zc_bufs.emplace_back(std::move(tmp));
+                _zc_len += n;
+                if (_zc_len >= _buffer_size) {
+                    if (_trim_to_size) {
+                        return zero_copy_split_and_put(std::move(_zc_bufs), std::exchange(_zc_len, 0));
+                    } else {
+                        _zc_len = 0;
+                        return zero_copy_put(std::move(_zc_bufs));
+                    }
+                }
+                return make_ready_future<>();
+            }
+            if (_trim_to_size) {
+                return split_and_put(std::move(tmp));
+            } else {
+                return put(std::move(tmp));
+            }
+        }
+
+        if (!_buf) {
+            _buf = _fd.allocate_buffer(_buffer_size);
+        }
+
+        auto now = std::min(n, _buf.size() - _end);
+        std::copy(buf, buf + now, _buf.get_write() + _end);
+        _end += now;
+        if (now == n) {
+            return make_ready_future<>();
+        }
+        temporary_buffer<char> next = _fd.allocate_buffer(std::max(n - now, _buffer_size));
+        std::copy(buf + now, buf + n, next.get_write());
+        // Buffer is full. Seal both _buf and next into _zc_bufs if zero-copy
+        // data is pending (to preserve ordering), or if _buf is a trim_front'd
+        // remnant (flushing it directly would produce an undersized non-last chunk).
+        if (!_zc_bufs.empty() || _buf.size() < _buffer_size) {
+            _zc_bufs.emplace_back(_buf.share(0, _end));
+            _buf.trim_front(_end);
+            if (!_buf.size()) {
+                _buf = {};
+            }
+            _zc_len += _end;
+            _end = 0;
+            next.trim(n - now);
+            _zc_len += n - now;
+            _zc_bufs.emplace_back(std::move(next));
+            if (_zc_len >= _buffer_size) {
+                if (_trim_to_size) {
+                    return zero_copy_split_and_put(std::move(_zc_bufs), std::exchange(_zc_len, 0));
+                } else {
+                    _zc_len = 0;
+                    return zero_copy_put(std::move(_zc_bufs));
+                }
+            }
+            return make_ready_future<>();
+        }
+
+
+        if (n - now >= _buffer_size) {
+            _end = 0;
+            return put(std::move(_buf)).then([this, next = std::move(next)]() mutable {
+                if (_trim_to_size) {
+                    return split_and_put(std::move(next));
+                } else {
+                    return put(std::move(next));
+                }
+            });
+        }
+
+        _end = n - now;
+        return put(std::exchange(_buf, std::move(next)));
+    } catch (...) {
+      return current_exception_as_future();
+    }
+}
+
+namespace internal {
+void add_to_flush_poller(output_stream<char>& x) noexcept;
+}
+
+template <typename CharType>
+future<> output_stream<CharType>::do_flush() noexcept {
+    if (_end) {
+        if (_zc_bufs.empty()) {
+            _buf.trim(_end);
+            _end = 0;
+            return _fd.put(std::move(_buf)).then([this] {
+                return _fd.flush();
+            });
+        } else {
+            // Fold buffered tail into the zero-copy vector and flush together.
+            _zc_bufs.emplace_back(_buf.share(0, _end));
+            _buf.trim_front(_end);
+            _zc_len += _end;
+            _end = 0;
+        }
+    }
+    if (!_zc_bufs.empty()) {
+        _zc_len = 0;
+        return _fd.put(std::move(_zc_bufs)).then([this] {
+            return _fd.flush();
+        });
+    } else {
+        return _fd.flush();
+    }
+}
+
+template <typename CharType>
+future<>
+output_stream<CharType>::flush() noexcept {
+    if (!_batch_flushes) {
+        return do_flush();
+    } else {
+        if (_ex) {
+            // flush is a good time to deliver outstanding errors
+            return make_exception_future<>(std::move(_ex));
+        } else {
+            _flush = true;
+            if (!_in_batch) {
+                internal::add_to_flush_poller(*this);
+                _in_batch = promise<>();
+            }
+        }
+    }
+    return make_ready_future<>();
+}
+
+template <typename CharType>
+future<>
+output_stream<CharType>::put(temporary_buffer<CharType> buf) noexcept {
+    // if flush is scheduled, disable it, so it will not try to write in parallel
+    _flush = false;
+    if (_flushing) {
+        // flush in progress, wait for it to end before continuing
+        return _in_batch.value().get_future().then([this, buf = std::move(buf)] () mutable {
+            return _fd.put(std::move(buf));
+        });
+    } else {
+        return _fd.put(std::move(buf));
+    }
+}
+
+template <typename CharType>
+void
+output_stream<CharType>::poll_flush() noexcept {
+    if (!_flush) {
+        // flush was canceled, do nothing
+        _flushing = false;
+        _in_batch.value().set_value();
+        _in_batch = std::nullopt;
+        return;
+    }
+
+    _flush = false;
+    _flushing = true; // make whoever wants to write into the fd to wait for flush to complete
+
+    // FIXME: future is discarded
+    (void)do_flush().then_wrapped([this] (future<> f) {
+        try {
+            f.get();
+        } catch (...) {
+            _ex = std::current_exception();
+            _fd.on_batch_flush_error();
+        }
+        // if flush() was called while flushing flush once more
+        poll_flush();
+    });
+}
+
+template <typename CharType>
+future<>
+output_stream<CharType>::close() noexcept {
+    return flush().finally([this] {
+        if (_in_batch) {
+            return _in_batch.value().get_future();
+        } else {
+            return make_ready_future();
+        }
+    }).then([this] {
+        // report final exception as close error
+        if (_ex) {
+            std::rethrow_exception(_ex);
+        }
+    }).finally([this] {
+        return _fd.close();
+    });
+}
+
+template <typename CharType>
+data_sink
+output_stream<CharType>::detach() && {
+    if (_buf || !_zc_bufs.empty()) {
+        throw std::logic_error("detach() called on a used output_stream");
+    }
+
+    return std::move(_fd);
+}
+
+namespace internal {
+
+/// \cond internal
+template <typename CharType>
+struct stream_copy_consumer {
+private:
+    output_stream<CharType>& _os;
+    using consumption_result_type = consumption_result<CharType>;
+public:
+    stream_copy_consumer(output_stream<CharType>& os) : _os(os) {
+    }
+    future<consumption_result_type> operator()(temporary_buffer<CharType> data) {
+        if (data.empty()) {
+            return make_ready_future<consumption_result_type>(stop_consuming(std::move(data)));
+        }
+        return _os.write(data.get(), data.size()).then([] {
+            return make_ready_future<consumption_result_type>(continue_consuming());
+        });
+    }
+};
+
+/// \endcond
+
+}
+
+extern template struct internal::stream_copy_consumer<char>;
+
+template <typename CharType>
+future<> copy(input_stream<CharType>& in, output_stream<CharType>& out) {
+    return in.consume(internal::stream_copy_consumer<CharType>(out));
+}
+
+/// \brief copy exactly \c n bytes from the input stream to the output stream
+///
+/// \throws std::runtime_error if the input stream reaches end-of-stream before
+/// \c n bytes have been copied.
+template <typename CharType>
+future<> copy_n(input_stream<CharType>& in, output_stream<CharType>& out, size_t n) {
+    while (n != 0) {
+        auto buf = co_await in.read_up_to(n);
+        if (buf.empty()) {
+            throw std::runtime_error("copy_n: input stream reached end-of-stream before copying the requested number of bytes");
+        }
+        n -= buf.size();
+        co_await out.write(std::move(buf));
+    }
+}
+
+extern template future<> copy<char>(input_stream<char>&, output_stream<char>&);
+}

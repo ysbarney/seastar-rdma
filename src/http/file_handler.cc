@@ -1,0 +1,163 @@
+/*
+ * This file is open source software, licensed to you under the terms
+ * of the Apache License, Version 2.0 (the "License").  See the NOTICE file
+ * distributed with this work for additional information regarding copyright
+ * ownership.  You may not use this file except in compliance with the License.
+ *
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+/*
+ * Copyright 2015 Cloudius Systems
+ */
+
+
+#include <algorithm>
+#include <memory>
+#include <string_view>
+
+#include <seastar/http/file_handler.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/http/exception.hh>
+
+namespace seastar {
+
+namespace httpd {
+
+// Refuse a decoded path that could escape doc_root: any ".." segment, or a
+// leading '/' (get_decoded_param() strips the matcher's own '/', so one here
+// means a doubled slash like "//etc"). It also percent-decodes the value, so
+// encoded traversal like "%2e%2e%2f" is already "../" and is caught here too.
+static bool is_unsafe_path(std::string_view path) {
+    if (!path.empty() && path.front() == '/') {
+        return true;
+    }
+    for (size_t start = 0; start <= path.size();) {
+        size_t sep = path.find('/', start);
+        auto segment = path.substr(start, sep - start);
+        if (segment == "..") {
+            return true;
+        }
+        if (sep == std::string_view::npos) {
+            break;
+        }
+        start = sep + 1;
+    }
+    return false;
+}
+
+directory_handler::directory_handler(const sstring& doc_root,
+        file_transformer* transformer)
+        : file_interaction_handler(transformer), doc_root(doc_root) {
+}
+
+future<std::unique_ptr<http::reply>> directory_handler::handle(const sstring& path,
+        std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) {
+    sstring decoded_path = req->param.get_decoded_param("path");
+    if (is_unsafe_path(decoded_path)) {
+        rep->set_status(http::reply::status_type::not_found);
+        return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
+    }
+    sstring full_path = doc_root + decoded_path;
+    auto h = this;
+    return engine().file_type(full_path).then(
+            [h, full_path, req = std::move(req), rep = std::move(rep)](auto val) mutable {
+                if (val) {
+                    if (val.value() == directory_entry_type::directory) {
+                        if (h->redirect_if_needed(*req.get(), *rep.get())) {
+                            return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
+                        }
+                        full_path += "/index.html";
+                    }
+                    return h->read(full_path, std::move(req), std::move(rep));
+                }
+                rep->set_status(http::reply::status_type::not_found);
+                return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
+
+            });
+}
+
+file_interaction_handler::~file_interaction_handler() {
+    delete transformer;
+}
+
+sstring file_interaction_handler::get_extension(const sstring& file) {
+    size_t last_slash_pos = file.find_last_of('/');
+    size_t last_dot_pos = file.find_last_of('.');
+    sstring extension;
+    if (last_dot_pos != sstring::npos &&
+            (last_slash_pos == sstring::npos || last_dot_pos > last_slash_pos)) {
+        extension = file.substr(last_dot_pos + 1);
+    }
+    // normalize file extension for mime type
+    std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+    return extension;
+}
+
+output_stream<char> file_interaction_handler::get_stream(std::unique_ptr<http::request> req,
+        const sstring& extension, output_stream<char>&& s) {
+    if (transformer) {
+        return transformer->transform(std::move(req), extension, std::move(s));
+    }
+    return std::move(s);
+}
+
+future<std::unique_ptr<http::reply>> file_interaction_handler::read(
+        sstring file_name, std::unique_ptr<http::request> req,
+        std::unique_ptr<http::reply> rep) {
+    sstring extension = get_extension(file_name);
+    rep->write_body(extension, [req = std::move(req), extension, file_name, this] (output_stream<char>&& s) mutable {
+        return do_with(get_stream(std::move(req), extension, std::move(s)),
+                [file_name] (output_stream<char>& os) {
+            return open_file_dma(file_name, open_flags::ro).then([&os] (file f) {
+                return do_with(make_file_input_stream(std::move(f)), [&os](input_stream<char>& is) {
+                    return copy(is, os).finally([&os] {
+                        return os.close();
+                    }).finally([&is] {
+                        return is.close();
+                    });
+                });
+            });
+        });
+    });
+    return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
+}
+
+bool file_interaction_handler::redirect_if_needed(const http::request& req,
+        http::reply& rep) const {
+    auto location = req.get_url();
+    auto query_pos = location.find('?');
+    auto insert_pos = (query_pos == sstring::npos) ? location.size() : query_pos;
+
+    if (insert_pos == 0 || location[insert_pos - 1] != '/') {
+        location.replace(insert_pos, 0, "/", 1);
+
+        rep.set_status(http::reply::status_type::moved_permanently);
+        rep._headers["Location"] = std::move(location);
+        return true;
+    }
+    return false;
+}
+
+future<std::unique_ptr<http::reply>> file_handler::handle(const sstring& path,
+        std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) {
+    if (force_path && redirect_if_needed(*req.get(), *rep.get())) {
+        return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
+    }
+    return read(file, std::move(req), std::move(rep));
+}
+
+}
+
+}
