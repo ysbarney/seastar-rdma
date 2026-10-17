@@ -145,6 +145,179 @@ There are also instructions for building on any host that supports [Docker](doc/
 
 Use of [DPDK](https://www.dpdk.org/) is [optional](doc/building-dpdk.md).
 
+RDMA Support
+------------
+
+Seastar includes an optional RDMA networking stack that provides ultra-low-latency,
+zero-copy data transfer using RDMA verbs over RoCEv2. The stack runs RDMA over a
+TCP connection: TCP carries the initial handshake (and stays open as a liveness detector),
+while data flows over an RC (Reliable Connected) QP pair established by the handshake.
+
+Connections to peers that do not speak the RDMA handshake automatically downgrade to
+plain TCP on the same connection.
+
+### Hardware Requirements
+
+For optimal RDMA performance:
+
+* **NIC**: InfiniBand or RoCEv2-capable network interface card (10G or 40G recommended)
+* **Cores**: As many as you need; RDMA scales well with multiple cores and NUMA systems
+* **Memory**: Sufficient memory for registered buffers (see configuration options below)
+
+### Installation
+
+Ensure your system has RDMA libraries installed:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install libibverbs-dev librdmacm-dev infiniband-diags
+
+# RHEL/CentOS
+sudo yum install libibverbs-utils librdmacm-utils rdma-core-devel
+```
+
+### Building with RDMA
+
+Configure Seastar to enable RDMA support:
+
+```bash
+# Using system packages
+sudo ./install-dependencies.sh
+
+# Enable RDMA (default: enabled on systems with RDMA support)
+./configure.py --mode=release
+ninja -C build/release
+```
+
+The build system automatically detects RDMA support and compiles the RDMA stack when
+`SEASTAR_HAVE_RDMA` is defined.
+
+### Using the RDMA Stack in Your Application
+
+#### Via CMake
+
+```cmake
+set (CMAKE_CXX_STANDARD 23)
+
+find_package (Seastar REQUIRED)
+
+add_executable (my_app
+  my_app.cc)
+
+target_link_libraries (my_app
+  Seastar::seastar)
+
+# Link against RDMA stack (if available)
+target_link_libraries (my_app PRIVATE Seastar::seastar_rdma)
+```
+
+#### Via pkg-config
+
+```bash
+g++ my_app.cc $(pkg-config --libs --cflags --static seastar_rdma) -o my_app
+```
+
+### Configuration Options
+
+When using the RDMA stack, you can configure several parameters:
+
+```bash
+./configure.py \
+  --mode=release \
+  --rdma-device=<device_name> \    # RDMA device (empty = first active)
+  --rdma-port=<port_number> \      # Port number on device (default: 1)
+  --rdma-gid-index=<index> \       # GID index (empty = auto)
+  --rdma-polling=false \           # True for busy-polling CQs (lower latency, higher CPU)
+  --rdma-qp-depth=128 \            # SQ/RQ depth per QP
+  --rdma-qp-pool-size=256 \        # Pre-created QP pool per shard
+  --rdma-block-size=8192 \         # Receive block size
+  --rdma-zcopy-min-size=262144 \   # Minimum payload for zero-copy direct-send
+  --rdma-max-regions=64            # Max registered memory regions per size class
+```
+
+### Using RDMA in Your Code
+
+The RDMA stack integrates with Seastar's network API. Connections are automatically
+upgraded to RDMA when both peers support it:
+
+```cpp
+#include <seastar/core/reactor.hh>
+#include <seastar/net/api.hh>
+#include <seastar/net/rdma-stack.hh>
+
+using namespace seastar;
+using namespace seastar::net;
+
+seastar::future<> rdma_server() {
+    // Register the RDMA stack
+    auto stack = register_rdma_stack();
+    unsigned port = 9000;
+
+    return do_with(stack, port, [] (auto& stack, unsigned port) {
+        return listen(stack, socket_address{ipv4_addr{127, 0, 0, 1}, port})
+            .then([] (listening_socket ls) {
+                return ls.accept();
+            })
+            .then([] (auto&& conn) {
+                std::cout << "Connection established over RDMA!" << std::endl;
+                // Handle connection - automatic zero-copy if RDMA supported
+                return conn.input_stream().read_until_exactly(1024)
+                    .then([] (temporary_buffer<char> buf) {
+                        std::cout << "Received: " << buf.size() << " bytes" << std::endl;
+                    });
+            });
+    });
+}
+```
+
+#### Key Features
+
+* **Automatic upgrade**: Connections automatically upgrade to RDMA when both peers support it
+* **Graceful fallback**: Peers that don't support RDMA automatically downgrade to TCP
+* **Zero-copy transfers**: Large messages (≥256KB by default) use direct-send path
+* **Flow control**: Built-in receive-window and send-window management
+* **Liveness detection**: TCP socket remains open as a heartbeat for connection health
+
+#### Performance Tips
+
+1. **Enable busy-polling** for lowest latency (increases CPU usage):
+   ```bash
+   --rdma-polling=true
+   ```
+
+2. **Increase receive block size** for larger zero-copy messages:
+   ```bash
+   --rdma-block-size=65536
+   ```
+
+3. **Adjust QP depth** based on your workload:
+   ```bash
+   --rdma-qp-depth=512
+   ```
+
+4. **Use multiple cores** on NUMA systems - bind NIC to specific cores for best performance
+
+### Debugging and Monitoring
+
+Enable debug logging for RDMA operations:
+
+```bash
+RUST_LOG=seastar::net::rdma=debug ./your_app
+```
+
+Common debugging commands:
+
+```bash
+# List RDMA devices
+ibv_devinfo
+
+# Check RDMA device status
+ibstat
+
+# Monitor RDMA connections
+ibv_devinfo -v
+```
+
 #### <a id="cxx-standard"></a>Seastar's C++ standard: C++23 or C++26
 
 Seastar supports both C++23 and C++26. The build defaults to the latest
