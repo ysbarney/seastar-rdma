@@ -202,7 +202,8 @@ qp_resources rdma_device::acquire_qp() {
     return r;
 }
 
-t verbs* v = verbs_provider();
+void rdma_device::release_qp(qp_resources&& r) {
+    const verbs* v = verbs_provider();
     // Transition the QP back to RESET and drain its CQs so the next
     // renter starts clean (same dance as brpc DeallocateResources).
     qp_attr_desc d{};

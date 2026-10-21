@@ -272,3 +272,25 @@ const verbs real_verbs = {
 };
 
 } // anonymous namespace
+
+// The active table. The real table is installed at static-init time;
+// a test may replace it via set_verbs_provider_for_test() before the
+// engine starts (single-threaded by then, no synchronization needed).
+static std::atomic<const verbs*> active_verbs{nullptr};
+
+const verbs* verbs_provider() noexcept {
+    const verbs* v = active_verbs.load(std::memory_order_acquire);
+    if (!v) {
+        v = &real_verbs;
+        active_verbs.store(v, std::memory_order_release);
+    }
+    return v;
+}
+
+void set_verbs_provider_for_test(const verbs* v) noexcept {
+    active_verbs.store(v, std::memory_order_release);
+}
+
+} // namespace seastar::net::rdma
+
+#endif // SEASTAR_HAVE_RDMA

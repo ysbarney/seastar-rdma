@@ -108,3 +108,5 @@ private:
 };
 
 } // namespace seastar::net::rdma
+
+#endif // SEASTAR_HAVE_RDMA

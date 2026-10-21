@@ -105,12 +105,22 @@ public:
 
     void shutdown_input() override {
         if (_ctx->is_rdma()) {
-            // Async FIN; errors surface via streams.
-            (void)_ctx->ep().shutdown_output().handle_exception([] (std::exception_ptr) {});
+          // Best effort: stop delivering; the peer learns via FIN or
+          // connection teardown.
+          _ctx->ep().fail(ENOTCONN); // resolves readers
         } else {
-            _ctx->fd().shutdown(SHUT_WR);
+            _ctx->fd().shutdown(SHUT_RD);
         }
     }
+
+  void shutdown_output() override {
+      if (_ctx->is_rdma()) {
+          // Async FIN; errors surface via streams.
+          (void)_ctx->ep().shutdown_output().handle_exception([] (std::exception_ptr) {});
+      } else {
+          _ctx->fd().shutdown(SHUT_WR);
+      }
+  }
 
     void set_nodelay(bool) override {}
     bool get_nodelay() const override { return true; }

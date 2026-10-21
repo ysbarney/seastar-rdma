@@ -162,7 +162,6 @@ SEASTAR_TEST_CASE(rdma_large_block_direct_send_echo) {
     co_await out.flush();
     temporary_buffer<char> b = co_await in.read_exactly(small.size() + big);
     BOOST_REQUIRE_EQUAL(b.size(), small.size() + big);
-    BOOST_REQUIRE(std::memcmp(b.get(), small.size() + big);
     BOOST_REQUIRE(std::memcmp(b.get(), small.data(), small.size()) == 0);
     for (size_t i = 0; i < big; ++i) {
         BOOST_REQUIRE_EQUAL(b.get()[small.size() + i], 'd');

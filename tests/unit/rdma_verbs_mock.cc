@@ -199,7 +199,7 @@ void push_cq_event(mock_cq* cq) {
 // ---------------------------------------------------------------------------
 // provider implementation
 // ---------------------------------------------------------------------------
-// ol mock_enumerate_devices(const char* device_name, uint8_t port,
+bool mock_enumerate_devices(const char* device_name, uint8_t port,
                             gid_selection& out, device_caps& caps) {
     std::lock_guard<std::mutex> g(state().mtx);
     if (state().should_fail("enumerate_devices")) {

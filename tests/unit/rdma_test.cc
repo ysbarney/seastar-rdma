@@ -83,7 +83,7 @@ static future<> echo_server(server_socket& listener) {
     auto in = c.input();
     while (true) {
         temporary_buffer<char> buf = co_await in.read();
-        if (buf.emptty()) {
+        if (buf.empty()) {
             break;
         }
         co_await out.write(std::move(buf));
@@ -520,7 +520,7 @@ SEASTAR_TEST_CASE(rdma_direct_send_echo) {
     co_await std::move(server);
 }
 
-EASTAR_TEST_CASE(rdma_direct_send_no_mr_leak) {
+SEASTAR_TEST_CASE(rdma_direct_send_no_mr_leak) {
     // After the connection closes, all direct-path registrations must
     // be released (the per-shard pool regions persist; the delta is
     // only transient direct MRs, which must return to the base level).
